@@ -1,41 +1,50 @@
-/*
- * Reader-Writer Lock System with Queue Management
- *
- * This program implements a file-based reader-writer lock system with two independent processes:
- *
- * 1. Task Manager (main process): Accepts read/write tasks from command line and adds them to a queue file.
- * 2. Worker Process: Continuously processes tasks from the queue, managing concurrent access:
- *    - READ tasks (SHARED_LOCK): Can run simultaneously with other READ tasks, but blocked by WRITE tasks.
- *    - WRITE tasks (EXCLUSIVE_LOCK): Block all other operations (read or write) and wait for completion.
- *
- * Features:
- * - File-based inter-process communication via task_queue.dat
- * - Active process tracking to prevent conflicts
- * - Automatic task queuing when locks cannot be acquired
- * - Statistics logging (waiting, active, completed tasks)
- * - Random delays (200-1000ms) for read/write operations
- */
+/* Reader-Writer Lock System with Queue Management */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/file.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <limits.h>
+#include <semaphore.h>
 
 #define FILENAME "edit_parallel"
-#define QUEUE_FILE "task_queue.dat"
-#define QUEUE_LOCK_FILE "task_queue.lock"
-#define ACTIVE_PROCESSES_FILE "active_processes.dat"
+#define SHM_ACTIVE_FILE "active_processes_shm.dat"
+#define SEM_ACTIVE_NAME "/active_processes_sem"
 #define COMPLETED_TASKS_FILE "completed_tasks.dat"
-#define WORKER_SLEEP 1  /* seconds between retry attempts - reduced to check more frequently */
-#define MIN_DELAY_MS 200
-#define MAX_DELAY_MS 1000
+#define PLANNED_TASKS_FILE "planned_tasks.dat"
+#define LOGFILE "logfile.txt"
+#define SHM_QUEUE_NAME "/task_queue_shm"
+#define SHM_QUEUE_FILE "task_queue_shm.dat"
+#define SEM_QUEUE_NAME "/task_queue_sem"
+#define HASH_TABLE_SIZE 256
+#define MAX_QUEUE_SIZE 1024
+#define MAX_ACTIVE_PROCESSES 512
+
+#define WORKER_SLEEP 1
+#define MIN_DELAY_MS 500
+#define MAX_DELAY_MS 2000
 #define MAX_DATA_SIZE 1024
+#define BUFFER_SIZE 2048
+#define LOG_BUFFER_SIZE 4096
+#define ACTIVE_LIST_SIZE 2048
+
+#define CLEANUP_INTERVAL 20
+#define STATS_INTERVAL 5
+#define EMPTY_QUEUE_LOG_INTERVAL 10
+#define MAX_RECHECKS 5
+#define RECHECK_DELAY_US 100000
+#define FORK_DELAY_US 50000
+#define POST_TASK_DELAY_US 200000
+
 
 typedef enum {
     SHARED_LOCK = 0,
@@ -43,35 +52,83 @@ typedef enum {
     INVALID_LOCK = 2
 } LockType;
 
-// Structure to store lock information
 typedef struct {
     int fd;
     LockType lock_type;
 } LockInfo;
 
-/*
- * Assert
- *		Generates a fatal exception if the given condition is false.
- */
+typedef struct TaskData {
+    pid_t pid;
+    LockType lock_type;
+    char data[MAX_DATA_SIZE];
+    int next_index;
+    int in_use;
+} TaskData;
+
+typedef struct PidNode {
+    pid_t pid;
+    int next_index;
+    int in_use;
+    int was_in_queue;
+} PidNode;
+
+typedef struct {
+    int bucket_heads[HASH_TABLE_SIZE];
+    TaskData tasks[HASH_TABLE_SIZE * 4];
+    int free_list_head;
+    int count;
+} TaskDataHashTable;
+
+typedef struct {
+    int head_index;
+    int tail_index;
+    PidNode pids[MAX_QUEUE_SIZE];
+    int free_list_head;
+    int count;
+    int initialized;
+} PidSortedList;
+
+typedef struct {
+    TaskDataHashTable hash_table;
+    PidSortedList sorted_list;
+    int initialized;
+} TaskQueue;
+
+typedef struct ActiveProcess {
+    pid_t pid;
+    LockType lock_type;
+    int next_index;
+    int in_use;
+} ActiveProcess;
+
+typedef struct {
+    int bucket_heads[HASH_TABLE_SIZE];
+    ActiveProcess processes[HASH_TABLE_SIZE * 4];
+    int free_list_head;
+    int count;
+    int initialized;
+} ActiveProcessList;
+
+static ActiveProcessList* g_active_list = NULL;
+static sem_t* g_active_sem = NULL;
+static size_t g_active_list_size = 0;
+
 #define Assert(condition) \
 do { \
-    if (!(condition)) { \
-        fprintf(stderr, "Assertion failed: %s\n", #condition); \
+    if(!(condition)) { \
+        fprintf(stderr, "Fatal error: Assertion failed: %s\n", #condition); \
         exit(1); \
     } \
 } while (0)
 
-/**
- * Try to acquire lock in non-blocking mode
- * Returns NULL if lock cannot be acquired immediately
- */
+// Lock management
+
 LockInfo* try_acquire_lock_nonblocking(LockType lock_type)
 {
     LockInfo* lock_info;
-    int flags;
 
     lock_info = malloc(sizeof(LockInfo));
-    if (lock_info == NULL || lock_type == INVALID_LOCK)
+    if(lock_info == NULL || lock_type == INVALID_LOCK)
     {
         fprintf(stderr, "Fatal error: Failed to allocate lock info\n");
         exit(1);
@@ -79,63 +136,53 @@ LockInfo* try_acquire_lock_nonblocking(LockType lock_type)
 
     lock_info->lock_type = lock_type;
 
-    /* Open file with appropriate flags */
-    if (lock_type == SHARED_LOCK)
-    {
-        flags = O_RDONLY | O_CREAT;
-    }
-    else
-    {
-        /* Use O_RDWR to allow reading back after write */
-        flags = O_RDWR | O_CREAT | O_TRUNC;
-    }
-
-    lock_info->fd = open(FILENAME, flags, 0644);
-    if (lock_info->fd < 0)
+    lock_info->fd = open(FILENAME,
+                            lock_type == SHARED_LOCK ? O_RDONLY | O_CREAT :
+                                                        O_RDWR | O_CREAT | O_TRUNC,
+                            0644);
+    if(lock_info->fd < 0)
     {
         free(lock_info);
         return NULL;
     }
 
-    /* Try to acquire file lock in non-blocking mode */
-    if (lock_type == SHARED_LOCK)
+    if(lock_type == SHARED_LOCK)
     {
-        if (flock(lock_info->fd, LOCK_SH | LOCK_NB) < 0)
+        if(flock(lock_info->fd, LOCK_SH | LOCK_NB) < 0)
         {
             close(lock_info->fd);
             free(lock_info);
-            return NULL;  /* Lock not available */
+            return NULL;
         }
     }
     else
     {
-        if (flock(lock_info->fd, LOCK_EX | LOCK_NB) < 0)
+        if(flock(lock_info->fd, LOCK_EX | LOCK_NB) < 0)
         {
             close(lock_info->fd);
             free(lock_info);
-            return NULL;  /* Lock not available */
+            return NULL;
         }
     }
 
     return lock_info;
 }
 
-/*
- * Release lock
- */
 void release_lock_info(LockInfo* lock_info)
 {
     Assert(lock_info != NULL);
 
-    if (flock(lock_info->fd, LOCK_UN) < 0)
+    if(flock(lock_info->fd, LOCK_UN) < 0)
     {
-        fprintf(stderr, "Fatal error: Failed to release %s lock\n", lock_info->lock_type == SHARED_LOCK ? "SHARED" : "EXCLUSIVE");
+        fprintf(stderr, "Fatal error: Failed to release %s lock\n",
+                            lock_info->lock_type == SHARED_LOCK ? "SHARED" :
+                                "EXCLUSIVE");
         exit(1);
     }
 
     Assert(lock_info->fd >= 0);
 
-    if (close(lock_info->fd) != 0)
+    if(close(lock_info->fd) != 0)
     {
         fprintf(stderr, "Fatal error: Failed to close file\n");
         exit(1);
@@ -146,35 +193,26 @@ void release_lock_info(LockInfo* lock_info)
 
 void stream_write_logfile(const char* message)
 {
-    if (message == NULL)
-    {
+    if(message == NULL)
         return;
-    }
 
-    int logfile = open("logfile.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (logfile >= 0)
+    int logfile = open(LOGFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if(logfile >= 0)
     {
         size_t msg_len = strlen(message);
-        if (msg_len > 0)
-        {
+        if(msg_len > 0)
             write(logfile, message, msg_len);
-        }
         close(logfile);
-        return;
     }
-    /* Ignore errors - logging should not fail the program */
 }
 
-/* Generate random delay between min_ms and max_ms in milliseconds */
 void random_delay_ms(int min_ms, int max_ms)
 {
     int delay_ms;
     struct timespec ts;
 
-    if (max_ms <= min_ms)
-    {
+    if(max_ms <= min_ms)
         delay_ms = min_ms;
-    }
     else
     {
         delay_ms = min_ms + (rand() % (max_ms - min_ms + 1));
@@ -185,70 +223,55 @@ void random_delay_ms(int min_ms, int max_ms)
     nanosleep(&ts, NULL);
 }
 
+
 void read_from_file(pid_t pid, LockInfo* lock)
 {
     char buffer[1024];
-    char read_data[2048] = {0};
+    char read_data[BUFFER_SIZE] = {0};
     ssize_t bytes_read;
-    char log_message[4096];
+    char log_message[LOG_BUFFER_SIZE];
     int total_read = 0;
 
-    if (lock == NULL || lock->fd < 0)
+    if(lock == NULL || lock->fd < 0)
     {
         fprintf(stderr, "Fatal error: Invalid lock in read_from_file\n");
         return;
     }
 
-    /* Random delay before reading (10-100 ms) */
     random_delay_ms(MIN_DELAY_MS, MAX_DELAY_MS);
-
-    /* Seek to beginning to read entire file */
     lseek(lock->fd, 0, SEEK_SET);
 
     while ((bytes_read = read(lock->fd, buffer, sizeof(buffer) - 1)) > 0)
     {
         buffer[bytes_read] = '\0';
-        if (total_read + (int)bytes_read < (int)(sizeof(read_data) - 1))
+        if(total_read + (int)bytes_read < (int)(sizeof(read_data) - 1))
         {
             strcat(read_data, buffer);
             total_read += (int)bytes_read;
         }
     }
 
-    if (total_read > 0)
+    if(total_read > 0)
     {
-        /* Log what was read */
         snprintf(log_message, sizeof(log_message),
-                 "Process %d: Read %d bytes from file\n", (int)pid, total_read);
-        stream_write_logfile(log_message);
-
-        /* Log file contents (state of file after read) */
-        snprintf(log_message, sizeof(log_message),
-                 "Process %d: File contents (state after read): %s\n",
-                 (int)pid, read_data);
+                 "Process %d: Read %d bytes: %s\n", (int)pid, total_read, read_data);
         stream_write_logfile(log_message);
     }
     else
     {
         snprintf(log_message, sizeof(log_message),
-                 "Process %d: File is empty or read failed\n", (int)pid);
-        stream_write_logfile(log_message);
-
-        /* Log empty file state */
-        snprintf(log_message, sizeof(log_message),
-                 "Process %d: File contents (state after read): [FILE IS EMPTY]\n",
-                 (int)pid);
+                 "Process %d: File is empty\n", (int)pid);
         stream_write_logfile(log_message);
     }
 }
 
-char* random_data()
+char* random_data(void)
 {
     char* data;
-    int len = 100;  /* Reasonable length */
+    int len = 100;
 
     data = (char*)malloc(len + 1);
-    if (data == NULL)
+    if(data == NULL)
     {
         fprintf(stderr, "Fatal error: Failed to allocate memory for random data\n");
         exit(1);
@@ -256,627 +279,1107 @@ char* random_data()
 
     for (int i = 0; i < len; i++)
         data[i] = 'a' + rand() % 26;
-    data[len] = '\0';  /* Null terminator */
+    data[len] = '\0';
     return data;
 }
 
 void write_to_file(pid_t pid, char* write_data, LockInfo* lock)
 {
     ssize_t bytes_written;
-    char log_message[4096];
-    char write_buffer[2048];
-    char file_contents[2048] = {0};
-    ssize_t read_bytes;
+    char log_message[LOG_BUFFER_SIZE];
+    char write_buffer[BUFFER_SIZE];
 
-    if (lock == NULL || lock->fd < 0)
+    if(lock == NULL || lock->fd < 0)
     {
         fprintf(stderr, "Fatal error: Invalid lock in write_to_file\n");
         return;
     }
 
-    if (write_data == NULL)
+    if(write_data == NULL)
     {
         fprintf(stderr, "Fatal error: write_data is NULL\n");
         return;
     }
 
-    /* Random delay before writing (10-100 ms) */
     random_delay_ms(MIN_DELAY_MS, MAX_DELAY_MS);
-
-    /* Prepare write buffer */
     snprintf(write_buffer, sizeof(write_buffer), "Process %d: %s\n", (int)pid, write_data);
 
-    /* Log what will be written */
-    snprintf(log_message, sizeof(log_message),
-             "Process %d: Writing data: %s", (int)pid, write_buffer);
-    stream_write_logfile(log_message);
-
-    /* Write to file using low-level write() - PostgreSQL style */
     bytes_written = write(lock->fd, write_buffer, strlen(write_buffer));
-    if (bytes_written < 0) {
+    if(bytes_written < 0)
+    {
         fprintf(stderr, "Fatal error: write failed\n");
         return;
-    } else {
-        /* Ensure data is written to disk (like fsync in PostgreSQL) */
-        fsync(lock->fd);
+    }
 
-        /* Log successful write */
-        snprintf(log_message, sizeof(log_message),
-                 "Process %d: Successfully wrote %zd bytes\n", (int)pid, bytes_written);
-        stream_write_logfile(log_message);
+    fsync(lock->fd);
+    printf("Process %d: Wrote %zd bytes: %s", (int)pid, bytes_written, write_buffer);
+    stream_write_logfile(log_message);
+}
 
-        /* Read back file contents to verify and log */
-        /* Reset file position to beginning */
-        if (lseek(lock->fd, 0, SEEK_SET) < 0)
+// Active process management
+static int init_active_processes_list(void);
+static void cleanup_active_processes_list(void);
+static int active_list_add_process(pid_t pid, LockType lock_type);
+static int active_list_remove_process(pid_t pid);
+static int active_list_has_process_by_type(LockType filter_type);
+static int active_list_count_processes_by_type(LockType filter_type);
+static void active_list_get_formatted_list(char* buffer, size_t buffer_size);
+static void active_list_cleanup_dead_processes(void);
+
+static int has_active_process_by_type(LockType filter_type)
+{
+    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
+        return 0;
+
+    sem_wait(g_active_sem);
+    int result = active_list_has_process_by_type(filter_type);
+    sem_post(g_active_sem);
+    return result;
+}
+
+int has_active_write_process(void)
+{
+    return has_active_process_by_type(EXCLUSIVE_LOCK);
+}
+
+int has_any_active_process(void)
+{
+    return has_active_process_by_type(INVALID_LOCK);
+}
+
+int add_active_process(pid_t pid, LockType lock_type)
+{
+    if(g_active_list == NULL || g_active_sem == NULL)
+    {
+        if(init_active_processes_list() < 0)
+            return -1;
+    }
+
+    sem_wait(g_active_sem);
+    int result = active_list_add_process(pid, lock_type);
+    sem_post(g_active_sem);
+    return result;
+}
+
+int remove_active_process(pid_t pid)
+{
+    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
+        return -1;
+
+    sem_wait(g_active_sem);
+    int result = active_list_remove_process(pid);
+    sem_post(g_active_sem);
+    return result;
+}
+
+void cleanup_active_processes(void)
+{
+    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
+        return;
+
+    sem_wait(g_active_sem);
+    active_list_cleanup_dead_processes();
+    sem_post(g_active_sem);
+}
+
+// Queue management (shared memory)
+static TaskQueue* g_queue = NULL;
+static sem_t* g_queue_sem = NULL;
+static size_t g_queue_size = 0;
+
+static int hash_pid(pid_t pid)
+{
+    return ((int)pid) % HASH_TABLE_SIZE;
+}
+
+
+static void init_hash_table_buckets(int* bucket_heads, int size)
+{
+    for (int i = 0; i < size; i++)
+    {
+        bucket_heads[i] = -1;
+    }
+}
+
+static void init_task_data_free_list(TaskData* tasks, int array_size, int* free_list_head)
+{
+    *free_list_head = -1;
+    for (int i = 0; i < array_size - 1; i++)
+    {
+        tasks[i].next_index = i + 1;
+        tasks[i].in_use = 0;
+    }
+    tasks[array_size - 1].next_index = -1;
+    *free_list_head = 0;
+}
+static void init_active_process_free_list(ActiveProcess* processes, int array_size, int* free_list_head)
+{
+    *free_list_head = -1;
+
+    for (int i = 0; i < array_size - 1; i++)
+    {
+        processes[i].next_index = i + 1;
+        processes[i].in_use = 0;
+    }
+    processes[array_size - 1].next_index = -1;
+    *free_list_head = 0;
+}
+
+/* Open or create shared memory file (file-based for macOS compatibility) */
+static int open_shared_memory_file(const char* filename, size_t shm_size, int* is_new)
+{
+    int shm_fd;
+    struct stat st;
+
+    *is_new = 0;
+    shm_fd = open(filename, O_RDWR, 0666);
+    if(shm_fd < 0)
+    {
+        /* Doesn't exist, create new */
+        shm_fd = open(filename, O_CREAT | O_RDWR, 0666);
+        if(shm_fd < 0)
+            return -1;
+        *is_new = 1;
+    }
+    else
+    {
+        /* Check if size matches (might need to reinit if size changed) */
+        if (fstat(shm_fd, &st) != 0 || st.st_size == 0 || st.st_size != (off_t)shm_size)
+            *is_new = 1;  /* Can't stat or size mismatch, assume new */
+    }
+
+    /* Set size (always call ftruncate for file-based approach) */
+    if(ftruncate(shm_fd, shm_size) < 0)
+    {
+        close(shm_fd);
+        return -1;
+    }
+
+    return shm_fd;
+}
+
+/* Initialize shared memory queue (hash table + sorted list) */
+static int init_queue_sorted_list(void)
+{
+    int shm_fd;
+    size_t shm_size = sizeof(TaskQueue);
+    int is_new = 0;
+
+    /* Open or create shared memory file */
+    shm_fd = open_shared_memory_file(SHM_QUEUE_FILE, shm_size, &is_new);
+    if(shm_fd < 0)
+    {
+        perror("Fatal error: Failed to create shared memory file");
+        return -1;
+    }
+
+    /* Create or open semaphore FIRST (before mapping, to protect initialization) */
+    g_queue_sem = sem_open(SEM_QUEUE_NAME, O_CREAT, 0666, 1);
+    if(g_queue_sem == SEM_FAILED)
+    {
+        perror("Fatal error: Failed to create semaphore");
+        close(shm_fd);
+        return -1;
+    }
+
+    /* Map shared memory */
+    g_queue = (TaskQueue*)mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if(g_queue == MAP_FAILED)
+    {
+        perror("Fatal error: Failed to map shared memory");
+        sem_close(g_queue_sem);
+        close(shm_fd);
+        return -1;
+    }
+    g_queue_size = shm_size;
+
+    /* Initialize if first time (or if not initialized yet) - protected by semaphore */
+    sem_wait(g_queue_sem);
+
+    if(is_new || !g_queue->initialized)
+    {
+        memset(g_queue, 0, shm_size);
+
+        /* Initialize hash table */
+        init_hash_table_buckets(g_queue->hash_table.bucket_heads, HASH_TABLE_SIZE);
+        init_task_data_free_list(g_queue->hash_table.tasks, HASH_TABLE_SIZE * 4,
+                                 &g_queue->hash_table.free_list_head);
+        g_queue->hash_table.count = 0;
+
+        /* Initialize sorted list */
+        g_queue->sorted_list.head_index = -1;
+        g_queue->sorted_list.tail_index = -1;
+        g_queue->sorted_list.free_list_head = -1;
+        g_queue->sorted_list.count = 0;
+        g_queue->sorted_list.initialized = 1;
+
+        /* Initialize free list for sorted list */
+        for (int i = 0; i < MAX_QUEUE_SIZE - 1; i++)
         {
-            perror("lseek failed");
+            g_queue->sorted_list.pids[i].next_index = i + 1;
+            g_queue->sorted_list.pids[i].in_use = 0;
+            g_queue->sorted_list.pids[i].was_in_queue = 0;
         }
-        else
+        g_queue->sorted_list.pids[MAX_QUEUE_SIZE - 1].next_index = -1;
+        g_queue->sorted_list.free_list_head = 0;
+
+        g_queue->initialized = 1;
+    }
+
+    sem_post(g_queue_sem);
+
+    close(shm_fd);
+    return 0;
+}
+
+/* Cleanup shared memory (called on exit) */
+static void cleanup_queue_sorted_list(void)
+{
+    if(g_queue != NULL && g_queue != MAP_FAILED && g_queue_size > 0)
+    {
+        munmap(g_queue, g_queue_size);
+        g_queue = NULL;
+        g_queue_size = 0;
+    }
+    if(g_queue_sem != NULL && g_queue_sem != SEM_FAILED)
+    {
+        sem_close(g_queue_sem);
+        g_queue_sem = NULL;
+    }
+    /* Don't unlink the file - other processes may still be using it */
+}
+
+/* Add task data to hash table (or update if exists) */
+static int hash_table_add_task_data(pid_t pid, LockType lock_type, const char* data)
+{
+    if(g_queue == NULL)
+        return -1;
+
+    int bucket = hash_pid(pid);
+    int current = g_queue->hash_table.bucket_heads[bucket];
+
+    /* Check if task data already exists (update if it does) */
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    {
+        if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
         {
-            read_bytes = read(lock->fd, file_contents, sizeof(file_contents) - 1);
-            if (read_bytes > 0)
+            /* Update existing task data */
+            g_queue->hash_table.tasks[current].lock_type = lock_type;
+            if(data != NULL)
             {
-                file_contents[read_bytes] = '\0';
-            }
-            else if (read_bytes == 0)
-            {
-                strcpy(file_contents, "[FILE IS EMPTY]");
+                strncpy(g_queue->hash_table.tasks[current].data, data, MAX_DATA_SIZE - 1);
+                g_queue->hash_table.tasks[current].data[MAX_DATA_SIZE - 1] = '\0';
             }
             else
             {
-                strcpy(file_contents, "[READ ERROR]");
+                g_queue->hash_table.tasks[current].data[0] = '\0';
             }
-
-            /* Log file contents (state of file after write) */
-            snprintf(log_message, sizeof(log_message),
-                     "Process %d: File contents (state after write): %s\n",
-                     (int)pid, file_contents);
-            stream_write_logfile(log_message);
+            return 0;
         }
-
-        printf("Process %d: Wrote %zd bytes: %s", (int)pid, bytes_written, write_buffer);
+        if(g_queue->hash_table.tasks[current].next_index < 0)
+            break;
+        current = g_queue->hash_table.tasks[current].next_index;
     }
-}
 
-/* ------------------------------------------------------------
- * List implementation
- * Queue node is an element of waiting processes list in the queue
- *------------------------------------------------------------ */
+    /* Find free slot */
+    if(g_queue->hash_table.free_list_head < 0)
+        return -1;
 
-/* Queue node structure for List */
-struct QueueNode {
-    pid_t pid;
-    LockType lock_type;
-    char* data;
+    int free_index = g_queue->hash_table.free_list_head;
+    g_queue->hash_table.free_list_head = g_queue->hash_table.tasks[free_index].next_index;
 
-    struct QueueNode* next;
-    struct QueueNode* prev;
-};
-
-/* Forward declaration */
-typedef struct QueueNode QueueNode;
-
-/* Queue structure for List */
-typedef struct QueueList {
-    struct QueueNode* head;
-    struct QueueNode* tail;
-    int size;
-} QueueList;
-
-/* Initialize the queue */
-void init_queue(QueueList* queue)
-{
-    queue->head = NULL;
-    queue->tail = NULL;
-    queue->size = 0;
-}
-
-/* Add process to the end of the list */
-int queue_list_append(QueueList* list, struct QueueNode* node)
-{
-    struct QueueNode* current;
-
-    Assert(list != NULL);
-    Assert(node != NULL);
-
-    if(list->size == 0)
+    /* Initialize new task data */
+    g_queue->hash_table.tasks[free_index].pid = pid;
+    g_queue->hash_table.tasks[free_index].lock_type = lock_type;
+    if(data != NULL)
     {
-        list->head = node;
-        list->tail = node;
-        node->next = NULL;
-        node->prev = NULL;
+        strncpy(g_queue->hash_table.tasks[free_index].data, data, MAX_DATA_SIZE - 1);
+        g_queue->hash_table.tasks[free_index].data[MAX_DATA_SIZE - 1] = '\0';
     }
     else
     {
-        current = list->tail;
-        current->next = node;
-        node->prev = current;
-        node->next = NULL;
-        list->tail = node;
+        g_queue->hash_table.tasks[free_index].data[0] = '\0';
+    }
+    g_queue->hash_table.tasks[free_index].in_use = 1;
+    g_queue->hash_table.tasks[free_index].next_index = -1;
+
+    /* Add to bucket chain */
+    if(g_queue->hash_table.bucket_heads[bucket] >= 0)
+    {
+        /* Find end of chain (walk to the end) */
+        int chain_end = g_queue->hash_table.bucket_heads[bucket];
+        while (g_queue->hash_table.tasks[chain_end].next_index >= 0)
+        {
+            chain_end = g_queue->hash_table.tasks[chain_end].next_index;
+        }
+        g_queue->hash_table.tasks[chain_end].next_index = free_index;
+    }
+    else
+    {
+        g_queue->hash_table.bucket_heads[bucket] = free_index;
     }
 
-    list->size++;
-
+    g_queue->hash_table.count++;
     return 0;
 }
 
-/* Get and remove first node from the list */
-struct QueueNode* queue_list_pop_first(QueueList* list)
+/* Add PID to sorted list */
+static int sorted_list_add_pid(pid_t pid, int was_in_queue)
 {
-    struct QueueNode* node;
+    if(g_queue == NULL)
+        return -1;
 
-    if (list == NULL || list->size == 0)
+    /* Check if PID already exists in list */
+    int existing_index = -1;
+    int current = g_queue->sorted_list.head_index;
+    while (current >= 0 && current < MAX_QUEUE_SIZE)
     {
-        return NULL;
-    }
-
-    node = list->head;
-    if (node == NULL)
-    {
-        return NULL;
-    }
-
-    list->head = node->next;
-    if (list->head != NULL)
-    {
-        list->head->prev = NULL;
-    }
-    else
-    {
-        list->tail = NULL;
-    }
-
-    list->size--;
-
-    return node;
-}
-
-/* Check if there are active processes working with file */
-int has_active_write_process()
-{
-    FILE* active_file;
-    char line[256];
-    int file_pid;
-    int lock_type_int;
-    int has_write = 0;
-
-    active_file = fopen(ACTIVE_PROCESSES_FILE, "r");
-    if (active_file == NULL)
-    {
-        return 0;  /* No active processes file, no active writes */
-    }
-
-    while (fgets(line, sizeof(line), active_file) != NULL)
-    {
-        if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
+        if(g_queue->sorted_list.pids[current].in_use && g_queue->sorted_list.pids[current].pid == pid)
         {
-            /* Check if process is still alive */
-            if (kill((pid_t)file_pid, 0) == 0)
-            {
-                if (lock_type_int == EXCLUSIVE_LOCK)
-                {
-                    has_write = 1;
-                    break;
-                }
-            }
+            existing_index = current;
+            break;
         }
+        current = g_queue->sorted_list.pids[current].next_index;
     }
 
-    fclose(active_file);
-    return has_write;
-}
-
-int has_any_active_process()
-{
-    FILE* active_file;
-    char line[256];
-    int file_pid;
-    int lock_type_int;
-    int has_active = 0;
-
-    active_file = fopen(ACTIVE_PROCESSES_FILE, "r");
-    if (active_file == NULL)
+    if(existing_index >= 0)
     {
-        return 0;  /* No active processes */
-    }
-
-    while (fgets(line, sizeof(line), active_file) != NULL)
-    {
-        if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
+        /* PID already exists - was rejected, need to reinsert in sorted position */
+        /* First, find where to insert (before removing - otherwise we'll lose the position) */
+        int insert_pos = -1;
+        int insert_prev = -1;
+        int search_current = g_queue->sorted_list.head_index;
+        while (search_current >= 0 && search_current < MAX_QUEUE_SIZE)
         {
-            /* Check if process is still alive */
-            if (kill((pid_t)file_pid, 0) == 0)
+            /* Stop when we find a PID greater than current */
+            if(g_queue->sorted_list.pids[search_current].in_use && search_current != existing_index && (int)g_queue->sorted_list.pids[search_current].pid > (int)pid)
             {
-                has_active = 1;
+                insert_pos = search_current;
                 break;
             }
+            if(search_current != existing_index)
+                insert_prev = search_current;
+            search_current = g_queue->sorted_list.pids[search_current].next_index;
+        }
+
+        /* Remove from current position */
+        int prev_index = -1;
+        current = g_queue->sorted_list.head_index;
+        while (current >= 0 && current != existing_index)
+        {
+            prev_index = current;
+            current = g_queue->sorted_list.pids[current].next_index;
+        }
+
+        if(prev_index >= 0)
+        {
+            g_queue->sorted_list.pids[prev_index].next_index = g_queue->sorted_list.pids[existing_index].next_index;
+        }
+        else
+        {
+            g_queue->sorted_list.head_index = g_queue->sorted_list.pids[existing_index].next_index;
+        }
+
+        if(g_queue->sorted_list.tail_index == existing_index)
+            g_queue->sorted_list.tail_index = prev_index;
+
+        g_queue->sorted_list.pids[existing_index].was_in_queue = 1;
+
+        /* Insert at found position */
+        if(insert_pos >= 0)
+        {
+            /* Insert before insert_pos */
+            g_queue->sorted_list.pids[existing_index].next_index = insert_pos;
+            if(insert_prev >= 0)
+                g_queue->sorted_list.pids[insert_prev].next_index = existing_index;
+            else
+                /* Inserting at head (smallest PID) */
+                g_queue->sorted_list.head_index = existing_index;
+        }
+        else
+        {
+            /* Insert at end (largest PID or empty list) */
+            if(g_queue->sorted_list.tail_index >= 0)
+                g_queue->sorted_list.pids[g_queue->sorted_list.tail_index].next_index = existing_index;
+            g_queue->sorted_list.tail_index = existing_index;
+            g_queue->sorted_list.pids[existing_index].next_index = -1;
+            if(g_queue->sorted_list.head_index < 0)
+                g_queue->sorted_list.head_index = existing_index;  /* Was empty list */
+        }
+
+        return 0;
+    }
+
+    /* New PID - add to end of list if was_in_queue=0, otherwise insert in sorted position */
+    if(g_queue->sorted_list.free_list_head < 0)
+        return -1;  /* No free slots */
+
+    int free_index = g_queue->sorted_list.free_list_head;
+    g_queue->sorted_list.free_list_head = g_queue->sorted_list.pids[free_index].next_index;
+
+    /* Initialize new PID node */
+    g_queue->sorted_list.pids[free_index].pid = pid;
+    g_queue->sorted_list.pids[free_index].in_use = 1;
+    g_queue->sorted_list.pids[free_index].next_index = -1;
+    g_queue->sorted_list.pids[free_index].was_in_queue = was_in_queue;
+
+    if(was_in_queue == 0)
+    {
+        /* New task - add to end of list (as per requirement) */
+        if(g_queue->sorted_list.tail_index >= 0)
+            g_queue->sorted_list.pids[g_queue->sorted_list.tail_index].next_index = free_index;
+        g_queue->sorted_list.tail_index = free_index;
+        if(g_queue->sorted_list.head_index < 0)
+            g_queue->sorted_list.head_index = free_index;
+    }
+    else
+    {
+        /* Repeated task - insert in sorted position (insertion sort from beginning) */
+        int insert_pos = -1;
+        int insert_prev = -1;
+        int search_current = g_queue->sorted_list.head_index;
+        while (search_current >= 0 && search_current < MAX_QUEUE_SIZE)
+        {
+            /* Stop when we find a PID greater than current */
+            if(g_queue->sorted_list.pids[search_current].in_use && (int)g_queue->sorted_list.pids[search_current].pid > (int)pid)
+            {
+                insert_pos = search_current;
+                break;
+            }
+            insert_prev = search_current;
+            search_current = g_queue->sorted_list.pids[search_current].next_index;
+        }
+
+        /* Insert at found position */
+        if(insert_pos >= 0)
+        {
+            /* Insert before insert_pos */
+            g_queue->sorted_list.pids[free_index].next_index = insert_pos;
+            if(insert_prev >= 0)
+                g_queue->sorted_list.pids[insert_prev].next_index = free_index;
+            else
+                /* Inserting at head */
+                g_queue->sorted_list.head_index = free_index;
+        }
+        else
+        {
+            /* Insert at end */
+            if(g_queue->sorted_list.tail_index >= 0)
+                g_queue->sorted_list.pids[g_queue->sorted_list.tail_index].next_index = free_index;
+            g_queue->sorted_list.tail_index = free_index;
+            if(g_queue->sorted_list.head_index < 0)
+                g_queue->sorted_list.head_index = free_index;
         }
     }
 
-    fclose(active_file);
-    return has_active;
-}
-
-/* Add process to active processes file */
-int add_active_process(pid_t pid, LockType lock_type)
-{
-    FILE* active_file;
-    int active_fd;
-
-    active_fd = open(ACTIVE_PROCESSES_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (active_fd < 0)
-    {
-        return -1;
-    }
-
-    if (flock(active_fd, LOCK_EX) < 0)
-    {
-        close(active_fd);
-        return -1;
-    }
-
-    active_file = fdopen(active_fd, "a");
-    if (active_file == NULL)
-    {
-        flock(active_fd, LOCK_UN);
-        close(active_fd);
-        return -1;
-    }
-
-    fprintf(active_file, "%d:%d\n", (int)pid, (int)lock_type);
-    fflush(active_file);
-
-    fclose(active_file);
-    flock(active_fd, LOCK_UN);
-    close(active_fd);
-
+    g_queue->sorted_list.count++;
     return 0;
 }
 
-/* Remove process from active processes file */
-int remove_active_process(pid_t pid)
+/* Add task to queue (hash table + sorted list) */
+static int sorted_list_add_task(pid_t pid, LockType lock_type, const char* data)
 {
-    FILE* active_file;
-    FILE* temp_file;
-    int active_fd;
-    char line[256];
-    char temp_filename[256];
-    int file_pid;
-    int lock_type_int;
-    int found = 0;
-
-    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", ACTIVE_PROCESSES_FILE);
-
-    active_fd = open(ACTIVE_PROCESSES_FILE, O_RDWR | O_CREAT, 0644);
-    if (active_fd < 0)
-    {
+    if((g_queue == NULL || g_queue_sem == NULL) && init_queue_sorted_list() < 0)
         return -1;
-    }
 
-    if (flock(active_fd, LOCK_EX) < 0)
-    {
-        close(active_fd);
-        return -1;
-    }
+    sem_wait(g_queue_sem);
 
-    active_file = fdopen(active_fd, "r+");
-    if (active_file == NULL)
+    /* Check if PID already exists in sorted list to determine if it's a new task */
+    int was_in_queue = 0;
+    int current = g_queue->sorted_list.head_index;
+    while (current >= 0 && current < MAX_QUEUE_SIZE)
     {
-        flock(active_fd, LOCK_UN);
-        close(active_fd);
-        return -1;
-    }
-
-    temp_file = fopen(temp_filename, "w");
-    if (temp_file != NULL)
-    {
-        while (fgets(line, sizeof(line), active_file) != NULL)
+        if(g_queue->sorted_list.pids[current].in_use && g_queue->sorted_list.pids[current].pid == pid)
         {
-            if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
-            {
-                if (file_pid != (int)pid)
-                {
-                    /* Keep this process, check if still alive */
-                    if (kill((pid_t)file_pid, 0) == 0)
-                    {
-                        fputs(line, temp_file);
-                    }
-                }
-                else
-                {
-                    found = 1;
-                }
-            }
+            was_in_queue = 1;
+            break;
         }
-        fclose(temp_file);
+        current = g_queue->sorted_list.pids[current].next_index;
     }
 
-    fclose(active_file);
-    flock(active_fd, LOCK_UN);
-    close(active_fd);
-
-    if (found)
+    /* Add task data to hash table */
+    if(hash_table_add_task_data(pid, lock_type, data) < 0)
     {
-        rename(temp_filename, ACTIVE_PROCESSES_FILE);
+        sem_post(g_queue_sem);
+        return -1;
+    }
+
+    /* Add PID to sorted list */
+    if(sorted_list_add_pid(pid, was_in_queue) < 0)
+    {
+        sem_post(g_queue_sem);
+        return -1;
+    }
+
+    sem_post(g_queue_sem);
+    return 0;
+}
+
+/* Remove task data from hash table */
+static void hash_table_remove_task_data(pid_t pid)
+{
+    if(g_queue == NULL)
+        return;
+
+    int bucket = hash_pid(pid);
+    int prev_index = -1;
+    int current = g_queue->hash_table.bucket_heads[bucket];
+
+    /* Find task in hash table */
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    {
+        if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
+        {
+            /* Remove from chain */
+            if(prev_index >= 0)
+            {
+                g_queue->hash_table.tasks[prev_index].next_index = g_queue->hash_table.tasks[current].next_index;
+            }
+            else if(g_queue->hash_table.bucket_heads[bucket] == current)
+            {
+                g_queue->hash_table.bucket_heads[bucket] = g_queue->hash_table.tasks[current].next_index;
+            }
+
+            /* Add to free list */
+            g_queue->hash_table.tasks[current].in_use = 0;
+            g_queue->hash_table.tasks[current].next_index = g_queue->hash_table.free_list_head;
+            g_queue->hash_table.free_list_head = current;
+
+            g_queue->hash_table.count--;
+            return;
+        }
+        prev_index = current;
+        current = g_queue->hash_table.tasks[current].next_index;
+    }
+}
+
+/* Get task data from hash table by PID (lookup) */
+static int hash_table_get_task_data(pid_t pid, LockType* lock_type, char* data, size_t data_size)
+{
+    if(g_queue == NULL)
+        return -1;
+
+    int bucket = hash_pid(pid);
+    int current = g_queue->hash_table.bucket_heads[bucket];
+
+    /* Find task in hash table */
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    {
+        if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
+        {
+            *lock_type = g_queue->hash_table.tasks[current].lock_type;
+            if(data != NULL && data_size > 0)
+            {
+                strncpy(data, g_queue->hash_table.tasks[current].data, data_size - 1);
+                data[data_size - 1] = '\0';
+            }
+            return 0;
+        }
+        current = g_queue->hash_table.tasks[current].next_index;
+    }
+
+    return -1;
+}
+
+/* Get and remove first task from sorted list (minimum PID - FIFO with priority) */
+static int sorted_list_get_task(pid_t* pid, LockType* lock_type, char* data, size_t data_size)
+{
+    if(g_queue == NULL || g_queue_sem == NULL)
+    {
+        if(init_queue_sorted_list() < 0)
+            return -1;
+    }
+
+    sem_wait(g_queue_sem);
+
+    if(g_queue->sorted_list.count == 0 || g_queue->sorted_list.head_index < 0)
+    {
+        sem_post(g_queue_sem);
+        return -1;
+    }
+
+    /* Get first PID from sorted list */
+    int selected_index = g_queue->sorted_list.head_index;
+    pid_t selected_pid = g_queue->sorted_list.pids[selected_index].pid;
+
+    /* Get task data from hash table */
+    if(hash_table_get_task_data(selected_pid, lock_type, data, data_size) < 0)
+    {
+        sem_post(g_queue_sem);
+        return -1;
+    }
+
+    /* Copy PID */
+    *pid = selected_pid;
+
+    /* Remove PID from sorted list */
+    g_queue->sorted_list.head_index = g_queue->sorted_list.pids[selected_index].next_index;
+    if(g_queue->sorted_list.tail_index == selected_index)
+        g_queue->sorted_list.tail_index = -1;
+
+    /* Add to free list */
+    g_queue->sorted_list.pids[selected_index].in_use = 0;
+    g_queue->sorted_list.pids[selected_index].was_in_queue = 0;
+    g_queue->sorted_list.pids[selected_index].next_index = g_queue->sorted_list.free_list_head;
+    g_queue->sorted_list.free_list_head = selected_index;
+
+    g_queue->sorted_list.count--;
+
+    /* Remove task data from hash table */
+    hash_table_remove_task_data(selected_pid);
+
+    sem_post(g_queue_sem);
+    return 0;
+}
+
+/* Count tasks in sorted list (thread-safe) */
+static int sorted_list_count_tasks(void)
+{
+    if(g_queue == NULL || g_queue_sem == NULL)
+    {
+        if(init_queue_sorted_list() < 0)
+            return 0;
+    }
+
+    sem_wait(g_queue_sem);
+    int count = g_queue->sorted_list.count;
+    sem_post(g_queue_sem);
+    return count;
+}
+
+// Active processes management
+
+static int init_active_processes_list(void)
+{
+    int shm_fd;
+    size_t shm_size = sizeof(ActiveProcessList);
+    int is_new = 0;
+
+    /* Open or create shared memory file */
+    shm_fd = open_shared_memory_file(SHM_ACTIVE_FILE, shm_size, &is_new);
+    if(shm_fd < 0)
+    {
+        perror("Fatal error: Failed to create shared memory file for active processes");
+        return -1;
+    }
+
+    /* Try to unlink existing semaphore first (in case it's in bad state) */
+    sem_unlink(SEM_ACTIVE_NAME);
+
+    /* Create or open semaphore FIRST (before mapping, to protect initialization) */
+    g_active_sem = sem_open(SEM_ACTIVE_NAME, O_CREAT | O_EXCL, 0666, 1);
+    if(g_active_sem == SEM_FAILED && errno == EEXIST)
+    {
+        /* Semaphore already exists, try to open it */
+        g_active_sem = sem_open(SEM_ACTIVE_NAME, 0);
+    }
+
+    if(g_active_sem == SEM_FAILED)
+    {
+        perror("Fatal error: Failed to create semaphore for active processes");
+        close(shm_fd);
+        return -1;
+    }
+
+    /* Map shared memory */
+    g_active_list = (ActiveProcessList*)mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if(g_active_list == MAP_FAILED)
+    {
+        perror("Fatal error: Failed to map shared memory for active processes");
+        sem_close(g_active_sem);
+        close(shm_fd);
+        return -1;
+    }
+    g_active_list_size = shm_size;
+
+    /* Initialize if first time (or if not initialized yet) - protected by semaphore */
+    /* Don't log before sem_wait - it may block if many processes write simultaneously */
+    int sem_result = sem_wait(g_active_sem);
+    if(sem_result != 0)
+    {
+        perror("sem_wait failed");
+        return -1;
+    }
+
+    if(g_active_list == NULL || g_active_list == MAP_FAILED)
+    {
+        sem_post(g_active_sem);
+        return -1;
+    }
+
+    if(is_new || !g_active_list->initialized)
+    {
+
+        memset(g_active_list, 0, shm_size);
+
+        /* Initialize hash table */
+        init_hash_table_buckets(g_active_list->bucket_heads, HASH_TABLE_SIZE);
+        init_active_process_free_list(g_active_list->processes, HASH_TABLE_SIZE * 4,
+                                     &g_active_list->free_list_head);
+        g_active_list->count = 0;
+        g_active_list->initialized = 1;
+    }
+
+    sem_post(g_active_sem);
+
+    close(shm_fd);
+    return 0;
+}
+
+/* Cleanup shared memory for active processes (called on exit) */
+static void cleanup_active_processes_list(void)
+{
+    if(g_active_list != NULL && g_active_list != MAP_FAILED && g_active_list_size > 0)
+    {
+        munmap(g_active_list, g_active_list_size);
+        g_active_list = NULL;
+        g_active_list_size = 0;
+    }
+    if(g_active_sem != NULL && g_active_sem != SEM_FAILED)
+    {
+        sem_close(g_active_sem);
+        g_active_sem = NULL;
+    }
+}
+
+/* Add active process to hash table (or update if exists) */
+static int active_list_add_process(pid_t pid, LockType lock_type)
+{
+    if(g_active_list == NULL)
+        return -1;
+
+    int bucket = hash_pid(pid);
+    int current = g_active_list->bucket_heads[bucket];
+
+    /* Check if process already exists */
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    {
+        if(g_active_list->processes[current].in_use &&
+            g_active_list->processes[current].pid == pid)
+        {
+            /* Update existing process */
+            g_active_list->processes[current].lock_type = lock_type;
+            return 0;
+        }
+        if(g_active_list->processes[current].next_index < 0)
+            break;
+        current = g_active_list->processes[current].next_index;
+    }
+
+    /* Find free slot */
+    if(g_active_list->free_list_head < 0)
+        return -1;  /* No free slots */
+
+    int free_index = g_active_list->free_list_head;
+    g_active_list->free_list_head =
+                g_active_list->processes[free_index].next_index;
+
+    /* Initialize new process */
+    g_active_list->processes[free_index].pid = pid;
+    g_active_list->processes[free_index].lock_type = lock_type;
+    g_active_list->processes[free_index].in_use = 1;
+    g_active_list->processes[free_index].next_index = -1;
+
+    /* Add to bucket chain */
+    if(g_active_list->bucket_heads[bucket] >= 0)
+    {
+        /* Find end of chain */
+        int chain_end = g_active_list->bucket_heads[bucket];
+
+        while (g_active_list->processes[chain_end].next_index >= 0)
+            chain_end = g_active_list->processes[chain_end].next_index;
+
+        g_active_list->processes[chain_end].next_index = free_index;
     }
     else
-    {
-        unlink(temp_filename);
-    }
+        /* First element in bucket */
+        g_active_list->bucket_heads[bucket] = free_index;
 
-    return found ? 0 : -1;
+    g_active_list->count++;
+    return 0;
 }
 
-/* Clean up stale processes from active processes file */
-void cleanup_active_processes()
+/* Remove active process from hash table (cleanup) */
+static int active_list_remove_process(pid_t pid)
 {
-    FILE* active_file;
-    FILE* temp_file;
-    int active_fd;
-    char line[256];
-    char temp_filename[256];
-    int file_pid;
-    int lock_type_int;
+    if(g_active_list == NULL)
+        return -1;
 
-    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", ACTIVE_PROCESSES_FILE);
+    int bucket = hash_pid(pid);
+    int prev_index = -1;
+    int current = g_active_list->bucket_heads[bucket];
 
-    active_fd = open(ACTIVE_PROCESSES_FILE, O_RDWR | O_CREAT, 0644);
-    if (active_fd < 0)
+    /* Find process in hash table */
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
     {
-        return;
-    }
-
-    if (flock(active_fd, LOCK_EX) < 0)
-    {
-        close(active_fd);
-        return;
-    }
-
-    active_file = fdopen(active_fd, "r+");
-    if (active_file == NULL)
-    {
-        flock(active_fd, LOCK_UN);
-        close(active_fd);
-        return;
-    }
-
-    temp_file = fopen(temp_filename, "w");
-    if (temp_file != NULL)
-    {
-        while (fgets(line, sizeof(line), active_file) != NULL)
+        if(g_active_list->processes[current].in_use && g_active_list->processes[current].pid == pid)
         {
-            if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
+            /* Remove from chain */
+            if(prev_index >= 0)
+                g_active_list->processes[prev_index].next_index = g_active_list->processes[current].next_index;
+            else if(g_active_list->bucket_heads[bucket] == current)
+                g_active_list->bucket_heads[bucket] = g_active_list->processes[current].next_index;
+
+            /* Add to free list */
+            g_active_list->processes[current].in_use = 0;
+            g_active_list->processes[current].next_index = g_active_list->free_list_head;
+            g_active_list->free_list_head = current;
+
+            g_active_list->count--;
+            return 0;
+        }
+        prev_index = current;
+        current = g_active_list->processes[current].next_index;
+    }
+
+    return -1;  /* Process not found */
+}
+
+/* Helper: Check if process is alive, remove if dead (cleanup zombie entries) */
+static int check_and_cleanup_process(pid_t pid)
+{
+    if(kill(pid, 0) == 0)
+        return 1;  /* Process is alive */
+    /* Process is dead, remove it (cleanup) */
+    active_list_remove_process(pid);
+    return 0;  /* Process was dead */
+}
+
+/* Helper: Iterate through all active processes (callback-based for flexibility) */
+typedef int (*ProcessCallback)(pid_t pid, LockType lock_type, void* user_data);
+
+static void iterate_active_processes(ProcessCallback callback, void* user_data, LockType filter_type)
+{
+    if(g_active_list == NULL)
+        return;
+
+    for (int i = 0; i < HASH_TABLE_SIZE; i++)
+    {
+        int current = g_active_list->bucket_heads[i];
+        while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+        {
+            if(g_active_list->processes[current].in_use)
             {
-                /* Check if process is still alive */
-                if (kill((pid_t)file_pid, 0) == 0)
+                pid_t pid = g_active_list->processes[current].pid;
+                LockType lock_type = g_active_list->processes[current].lock_type;
+
+                /* Check if process is still alive (cleanup dead ones) */
+                if(check_and_cleanup_process(pid))
                 {
-                    fputs(line, temp_file);
+                    /* If filter_type is INVALID_LOCK, match any; otherwise match specific type */
+                    if((filter_type == INVALID_LOCK || lock_type == filter_type) &&
+                                            callback(pid, lock_type, user_data) != 0)
+                            return;  /* Callback requested early termination (found what we needed) */
                 }
             }
+            current = g_active_list->processes[current].next_index;
         }
-        fclose(temp_file);
     }
-
-    fclose(active_file);
-    flock(active_fd, LOCK_UN);
-    close(active_fd);
-
-    rename(temp_filename, ACTIVE_PROCESSES_FILE);
 }
 
-/* Count tasks in queue file */
-int count_queue_tasks()
+/* Callback for checking existence (stop as soon as we find one) */
+static int check_exists_callback(pid_t pid, LockType lock_type, void* user_data)
 {
-    FILE* queue_file;
-    int queue_fd;
-    char line[4096];
+    (void)pid;
+    (void)lock_type;
+    int* found = (int*)user_data;
+    *found = 1;
+            return 1;
+}
+
+/* Check if process exists and is alive */
+static int active_list_has_process_by_type(LockType filter_type)
+{
+    int found = 0;
+    iterate_active_processes(check_exists_callback, &found, filter_type);
+    return found;
+}
+
+/* Callback for counting (just increment and continue) */
+static int count_callback(pid_t pid, LockType lock_type, void* user_data)
+{
+    (void)pid;
+    (void)lock_type;
+    int* count = (int*)user_data;
+    (*count)++;
+    return 0;  /* Continue iteration */
+}
+
+/* Count processes by type */
+static int active_list_count_processes_by_type(LockType filter_type)
+{
+    int count = 0;
+    iterate_active_processes(count_callback, &count, filter_type);
+    return count;
+}
+
+/* Callback for formatting list */
+typedef struct {
+    char* buffer;
+    size_t buffer_size;
+    size_t pos;
+    int first;
+} FormatContext;
+
+static int format_list_callback(pid_t pid, LockType lock_type, void* user_data)
+{
+    FormatContext* ctx = (FormatContext*)user_data;
+
+    if(!ctx->first && ctx->pos < ctx->buffer_size - 1)
+    {
+        ctx->buffer[ctx->pos++] = ',';
+        ctx->buffer[ctx->pos++] = ' ';
+    }
+    ctx->first = 0;
+
+    const char* type_str = (lock_type == SHARED_LOCK) ? "READ" : "WRITE";
+    int written = snprintf(ctx->buffer + ctx->pos, ctx->buffer_size - ctx->pos,
+                          "PID %d (%s)", (int)pid, type_str);
+    if(written > 0 && (size_t)written < ctx->buffer_size - ctx->pos)
+        ctx->pos += (size_t)written;
+
+    return 0;  /* Continue iteration */
+}
+
+/* Get list of active processes as formatted string */
+static void active_list_get_formatted_list(char* buffer, size_t buffer_size)
+{
+    FormatContext ctx = {buffer, buffer_size, 0, 1};
+    buffer[0] = '\0';
+
+    iterate_active_processes(format_list_callback, &ctx, INVALID_LOCK);
+
+    if(ctx.pos == 0)
+    {
+        strncpy(buffer, "none", buffer_size - 1);
+        buffer[buffer_size - 1] = '\0';
+    }
+    else
+        buffer[ctx.pos] = '\0';
+}
+
+/* Clean up dead processes */
+static void active_list_cleanup_dead_processes(void)
+{
+    /* Just iterate through all processes - check_and_cleanup_process will remove dead ones */
+    iterate_active_processes(count_callback, NULL, INVALID_LOCK);
+}
+
+int count_queue_tasks(void)
+{
+    return sorted_list_count_tasks();
+}
+
+
+static int count_active_processes_by_type(LockType filter_type)
+{
+    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
+        return 0;
+
+    sem_wait(g_active_sem);
+    int count = active_list_count_processes_by_type(filter_type);
+    sem_post(g_active_sem);
+    return count;
+}
+
+int count_active_processes(void)
+{
+    return count_active_processes_by_type(INVALID_LOCK);
+}
+
+int count_active_read_processes(void)
+{
+    return count_active_processes_by_type(SHARED_LOCK);
+}
+
+void get_active_processes_list(char* buffer, size_t buffer_size)
+{
+    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
+        return;
+
+    sem_wait(g_active_sem);
+    active_list_get_formatted_list(buffer, buffer_size);
+    sem_post(g_active_sem);
+}
+
+int get_planned_tasks_count(void)
+{
+    FILE* planned_file;
     int count = 0;
 
-    queue_fd = open(QUEUE_FILE, O_RDONLY | O_CREAT, 0644);
-    if (queue_fd < 0)
+    planned_file = fopen(PLANNED_TASKS_FILE, "r");
+    if(planned_file != NULL)
     {
-        return 0;
+        if(fscanf(planned_file, "%d", &count) != 1)
+            count = 0;
+        fclose(planned_file);
     }
 
-    if (flock(queue_fd, LOCK_SH) < 0)
+    return count;
+}
+
+void increment_planned_tasks(void)
+{
+    FILE* planned_file;
+    int queue_fd;
+    int count = get_planned_tasks_count();
+
+    queue_fd = open(PLANNED_TASKS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(queue_fd < 0)
+        return;
+
+    if(flock(queue_fd, LOCK_EX) < 0)
     {
         close(queue_fd);
-        return 0;
+        return;
     }
 
-    queue_file = fdopen(queue_fd, "r");
-    if (queue_file != NULL)
+    planned_file = fdopen(queue_fd, "w");
+    if(planned_file != NULL)
     {
-        while (fgets(line, sizeof(line), queue_file) != NULL)
-        {
-            /* Count non-empty lines that look like tasks (PID:LOCK_TYPE:DATA) */
-            if (strlen(line) > 0 && line[0] != '\n')
-            {
-                int dummy_pid, dummy_lock;
-                /* Check if line matches task format - just check for PID:LOCK_TYPE: */
-                if (sscanf(line, "%d:%d:", &dummy_pid, &dummy_lock) == 2)
-                {
-                    count++;
-                }
-            }
-        }
-        fclose(queue_file);
-    }
-    else
-    {
-        flock(queue_fd, LOCK_UN);
-        close(queue_fd);
-        return 0;
+        fprintf(planned_file, "%d\n", count + 1);
+        fflush(planned_file);
+        fclose(planned_file);
     }
 
     flock(queue_fd, LOCK_UN);
     close(queue_fd);
-
-    return count;
 }
 
-/* Count active processes */
-int count_active_processes()
-{
-    FILE* active_file;
-    char line[256];
-    int file_pid;
-    int lock_type_int;
-    int count = 0;
-
-    active_file = fopen(ACTIVE_PROCESSES_FILE, "r");
-    if (active_file == NULL)
-    {
-        return 0;
-    }
-
-    while (fgets(line, sizeof(line), active_file) != NULL)
-    {
-        if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
-        {
-            /* Check if process is still alive */
-            if (kill((pid_t)file_pid, 0) == 0)
-            {
-                count++;
-            }
-        }
-    }
-
-    fclose(active_file);
-    return count;
-}
-
-/* Count active read processes only */
-int count_active_read_processes()
-{
-    FILE* active_file;
-    char line[256];
-    int file_pid;
-    int lock_type_int;
-    int count = 0;
-
-    active_file = fopen(ACTIVE_PROCESSES_FILE, "r");
-    if (active_file == NULL)
-    {
-        return 0;
-    }
-
-    while (fgets(line, sizeof(line), active_file) != NULL)
-    {
-        if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
-        {
-            /* Check if process is still alive and is a read process */
-            if (kill((pid_t)file_pid, 0) == 0 && lock_type_int == SHARED_LOCK)
-            {
-                count++;
-            }
-        }
-    }
-
-    fclose(active_file);
-    return count;
-}
-
-/* Get list of active processes as string (for logging) */
-void get_active_processes_list(char* buffer, size_t buffer_size)
-{
-    FILE* active_file;
-    char line[256];
-    int file_pid;
-    int lock_type_int;
-    int first = 1;
-    size_t pos = 0;
-
-    buffer[0] = '\0';
-
-    active_file = fopen(ACTIVE_PROCESSES_FILE, "r");
-    if (active_file == NULL)
-    {
-        strncpy(buffer, "none", buffer_size - 1);
-        buffer[buffer_size - 1] = '\0';
-        return;
-    }
-
-    while (fgets(line, sizeof(line), active_file) != NULL)
-    {
-        if (sscanf(line, "%d:%d", &file_pid, &lock_type_int) == 2)
-        {
-            /* Check if process is still alive */
-            if (kill((pid_t)file_pid, 0) == 0)
-            {
-                if (!first)
-                {
-                    if (pos < buffer_size - 1)
-                    {
-                        buffer[pos++] = ',';
-                        buffer[pos++] = ' ';
-                    }
-                }
-                first = 0;
-
-                const char* type_str = (lock_type_int == SHARED_LOCK) ? "READ" : "WRITE";
-                int written = snprintf(buffer + pos, buffer_size - pos, "PID %d (%s)", file_pid, type_str);
-                if (written > 0 && (size_t)written < buffer_size - pos)
-                {
-                    pos += (size_t)written;
-                }
-            }
-        }
-    }
-
-    fclose(active_file);
-
-    if (pos == 0)
-    {
-        strncpy(buffer, "none", buffer_size - 1);
-        buffer[buffer_size - 1] = '\0';
-    }
-    else
-    {
-        buffer[pos] = '\0';
-    }
-}
-
-/* Get completed tasks count */
-int get_completed_tasks_count()
+int get_completed_tasks_count(void)
 {
     FILE* completed_file;
     int count = 0;
 
     completed_file = fopen(COMPLETED_TASKS_FILE, "r");
-    if (completed_file != NULL)
+    if(completed_file != NULL)
     {
-        if (fscanf(completed_file, "%d", &count) != 1)
-        {
+        if(fscanf(completed_file, "%d", &count) != 1)
             count = 0;
-        }
         fclose(completed_file);
     }
 
     return count;
 }
 
-/* Increment completed tasks count */
-void increment_completed_tasks()
+void increment_completed_tasks(void)
 {
     FILE* completed_file;
     int queue_fd;
     int count = get_completed_tasks_count();
 
     queue_fd = open(COMPLETED_TASKS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (queue_fd < 0)
-    {
+    if(queue_fd < 0)
         return;
-    }
 
-    if (flock(queue_fd, LOCK_EX) < 0)
+    if(flock(queue_fd, LOCK_EX) < 0)
     {
         close(queue_fd);
         return;
     }
 
     completed_file = fdopen(queue_fd, "w");
-    if (completed_file != NULL)
+    if(completed_file != NULL)
     {
         fprintf(completed_file, "%d\n", count + 1);
         fflush(completed_file);
@@ -887,15 +1390,13 @@ void increment_completed_tasks()
     close(queue_fd);
 }
 
-/* Print statistics */
-void print_statistics()
+void print_statistics(void)
 {
     int waiting = 0;
     int active = 0;
     int completed = 0;
-    char log_message[4096];
+    char log_message[LOG_BUFFER_SIZE];
 
-    /* Safely get statistics - ignore errors */
     waiting = count_queue_tasks();
     active = count_active_processes();
     completed = get_completed_tasks_count();
@@ -910,46 +1411,13 @@ void print_statistics()
     stream_write_logfile(log_message);
 }
 
-/* Add task to queue file (used by task manager process) */
 int add_task_to_queue_file(pid_t pid, LockType lock_type, const char* data)
 {
-    FILE* queue_file;
-    int queue_fd;
-    char log_message[4096];
+    char log_message[LOG_BUFFER_SIZE];
 
-    /* Open queue file with exclusive lock */
-    queue_fd = open(QUEUE_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (queue_fd < 0)
-    {
-        perror("Failed to open queue file");
+    if(sorted_list_add_task(pid, lock_type, data) < 0)
         return -1;
-    }
 
-    /* Lock file exclusively */
-    if (flock(queue_fd, LOCK_EX) < 0)
-    {
-        perror("Failed to lock queue file");
-        close(queue_fd);
-        return -1;
-    }
-
-    queue_file = fdopen(queue_fd, "a");
-    if (queue_file == NULL)
-    {
-        flock(queue_fd, LOCK_UN);
-        close(queue_fd);
-        return -1;
-    }
-
-    /* Write task to queue file: PID:LOCK_TYPE:DATA */
-    fprintf(queue_file, "%d:%d:%s\n", (int)pid, (int)lock_type, data != NULL ? data : "");
-    fflush(queue_file);
-
-    fclose(queue_file);
-    flock(queue_fd, LOCK_UN);
-    close(queue_fd);
-
-    /* Log that task was added to queue */
     snprintf(log_message, sizeof(log_message),
              "Task Manager: Task added to queue (PID %d, type: %s)\n",
              (int)pid, lock_type == SHARED_LOCK ? "READ" : "WRITE");
@@ -958,202 +1426,144 @@ int add_task_to_queue_file(pid_t pid, LockType lock_type, const char* data)
     printf("Task Manager: Task added to queue (PID %d, type: %s)\n",
            (int)pid, lock_type == SHARED_LOCK ? "READ" : "WRITE");
 
-    /* Don't print statistics here to avoid potential conflicts with file locks */
-    /* Statistics will be printed by worker process periodically */
+    return 0;
+}
+
+int get_task_from_queue_file(pid_t* pid, LockType* lock_type, char* data, size_t data_size)
+{
+    return sorted_list_get_task(pid, lock_type, data, data_size);
+}
+
+// Operation execution
+
+typedef void (*OperationCallback)(pid_t pid, LockInfo* lock, void* user_data);
+
+typedef struct {
+    pid_t task_pid;
+    LockType lock_type;
+    char* task_data;
+    int should_fork;  /* 1 for READ (fork), 0 for WRITE (direct execution) */
+} TaskContext;
+
+static int try_operation_common(pid_t pid, LockType lock_type,
+                                int (*check_blocking)(void),
+                                const char* operation_name,
+                                OperationCallback execute_op,
+                                void* user_data)
+{
+    LockInfo* lock;
+    char log_message[LOG_BUFFER_SIZE];
+    char active_list_before[ACTIVE_LIST_SIZE];
+    char active_list_after[ACTIVE_LIST_SIZE];
+
+    get_active_processes_list(active_list_before, sizeof(active_list_before));
+    int is_blocked = check_blocking();
+
+    if(is_blocked)
+    {
+        snprintf(log_message, sizeof(log_message),
+                 "Task Manager: %s operation for PID %d rejected - blocking processes detected, put back to queue. Blocking processes: %s\n",
+                 operation_name, (int)pid, active_list_before);
+        stream_write_logfile(log_message);
+        return -1;
+    }
+
+    lock = try_acquire_lock_nonblocking(lock_type);
+
+    if(lock == NULL)
+    {
+        snprintf(log_message, sizeof(log_message),
+                 "Task Manager: %s operation for PID %d rejected - failed to acquire lock, put back to queue. Blocking processes: %s\n",
+                 operation_name, (int)pid, active_list_before);
+        stream_write_logfile(log_message);
+        return -1;
+    }
+    add_active_process(pid, lock_type);
+    get_active_processes_list(active_list_after, sizeof(active_list_after));
+
+    snprintf(log_message, sizeof(log_message),
+             "Task Manager: %s operation for PID %d acquired lock. Active: %s\n",
+             operation_name, (int)pid, active_list_after);
+    stream_write_logfile(log_message);
+
+    execute_op(pid, lock, user_data);
+
+    release_lock_info(lock);
+    remove_active_process(pid);
+    increment_completed_tasks();
+
+    snprintf(log_message, sizeof(log_message),
+             "Task Manager: %s operation for PID %d completed\n",
+             operation_name, (int)pid);
+    stream_write_logfile(log_message);
 
     return 0;
 }
 
-/* Get and remove first task from queue file (used by worker process) */
-int get_task_from_queue_file(pid_t* pid, LockType* lock_type, char* data, size_t data_size)
+static void execute_read_callback(pid_t pid, LockInfo* lock, void* user_data)
 {
-    FILE* queue_file;
-    FILE* temp_file;
-    int queue_fd;
-    char line[4096];
-    char temp_filename[256];
-    int found = 0;
-    int file_pid;
-    int lock_type_int;
-    char task_data[MAX_DATA_SIZE];
-
-    snprintf(temp_filename, sizeof(temp_filename), "%s.tmp", QUEUE_FILE);
-
-    /* Check if queue file exists and has content */
-    queue_fd = open(QUEUE_FILE, O_RDWR | O_CREAT, 0644);
-    if (queue_fd < 0)
-    {
-        return -1;  /* File doesn't exist or can't be opened */
-    }
-
-    if (flock(queue_fd, LOCK_EX) < 0)
-    {
-        close(queue_fd);
-        return -1;
-    }
-
-    /* Check file size */
-    off_t file_size = lseek(queue_fd, 0, SEEK_END);
-    if (file_size <= 0)
-    {
-        flock(queue_fd, LOCK_UN);
-        close(queue_fd);
-        return -1;  /* File is empty */
-    }
-
-    /* Seek back to beginning */
-    if (lseek(queue_fd, 0, SEEK_SET) < 0)
-    {
-        flock(queue_fd, LOCK_UN);
-        close(queue_fd);
-        return -1;
-    }
-
-    queue_file = fdopen(queue_fd, "r+");
-    if (queue_file == NULL)
-    {
-        flock(queue_fd, LOCK_UN);
-        close(queue_fd);
-        return -1;
-    }
-
-    /* Read first line */
-    if (fgets(line, sizeof(line), queue_file) != NULL)
-    {
-        /* Clear task_data first */
-        memset(task_data, 0, MAX_DATA_SIZE);
-
-        /* Parse line: PID:LOCK_TYPE:DATA or PID:LOCK_TYPE: */
-        if (sscanf(line, "%d:%d:", &file_pid, &lock_type_int) == 2)
-        {
-            *pid = (pid_t)file_pid;
-            *lock_type = (LockType)lock_type_int;
-
-            /* Extract data part (everything after second colon) */
-            char* first_colon = strchr(line, ':');
-            if (first_colon != NULL)
-            {
-                char* second_colon = strchr(first_colon + 1, ':');
-                if (second_colon != NULL)
-                {
-                    second_colon++;  /* Skip the colon */
-                    /* Remove trailing newline if present */
-                    char* newline = strchr(second_colon, '\n');
-                    if (newline != NULL)
-                    {
-                        *newline = '\0';
-                    }
-                    /* Copy data, ensuring null termination */
-                    size_t data_len = strlen(second_colon);
-                    if (data_len > 0 && data_len < MAX_DATA_SIZE)
-                    {
-                        strncpy(task_data, second_colon, MAX_DATA_SIZE - 1);
-                        task_data[MAX_DATA_SIZE - 1] = '\0';
-                    }
-                    else
-                    {
-                        task_data[0] = '\0';
-                    }
-                }
-                else
-                {
-                    task_data[0] = '\0';
-                }
-            }
-            else
-            {
-                task_data[0] = '\0';
-            }
-
-            if (data != NULL && data_size > 0)
-            {
-                strncpy(data, task_data, data_size - 1);
-                data[data_size - 1] = '\0';
-            }
-            found = 1;
-        }
-    }
-
-    if (found)
-    {
-        /* Rewind and copy remaining lines to temp file (skip first line) */
-        rewind(queue_file);
-        temp_file = fopen(temp_filename, "w");
-        if (temp_file != NULL)
-        {
-            int first_line = 1;
-            int has_remaining = 0;
-            while (fgets(line, sizeof(line), queue_file) != NULL)
-            {
-                if (!first_line)
-                {
-                    fputs(line, temp_file);
-                    has_remaining = 1;
-                }
-                first_line = 0;
-            }
-            fclose(temp_file);
-
-            fclose(queue_file);
-            flock(queue_fd, LOCK_UN);
-            close(queue_fd);
-
-            /* Replace queue file with temp file (or remove if empty) */
-            if (has_remaining)
-            {
-                if (rename(temp_filename, QUEUE_FILE) < 0)
-                {
-                    unlink(temp_filename);
-                }
-            }
-            else
-            {
-                /* No remaining tasks, remove queue file */
-                unlink(temp_filename);
-                unlink(QUEUE_FILE);
-            }
-        }
-        else
-        {
-            fclose(queue_file);
-            flock(queue_fd, LOCK_UN);
-            close(queue_fd);
-            return -1;
-        }
-    }
-    else
-    {
-        fclose(queue_file);
-        flock(queue_fd, LOCK_UN);
-        close(queue_fd);
-    }
-
-    return found ? 0 : -1;
+    (void)user_data;
+    read_from_file(pid, lock);
 }
 
-/* Execute read task in forked process */
+static void execute_write_callback(pid_t pid, LockInfo* lock, void* user_data)
+{
+    char* write_data = NULL;
+
+    if(user_data != NULL)
+    {
+        const char* provided_data = (const char*)user_data;
+        if(strlen(provided_data) > 0)
+            write_data = strdup(provided_data);
+    }
+
+    if(write_data == NULL)
+        write_data = random_data();
+
+    if(write_data != NULL)
+    {
+        write_to_file(pid, write_data, lock);
+        free(write_data);
+    }
+}
+
+int try_read_operation(pid_t pid)
+{
+    return try_operation_common(pid, SHARED_LOCK,
+                                has_active_write_process,  /* Check for blocking WRITE processes */
+                                "READ",
+                                execute_read_callback,
+                                NULL);
+}
+
+int try_write_operation(pid_t pid, const char* data)
+{
+    return try_operation_common(pid, EXCLUSIVE_LOCK,
+                                has_any_active_process,  /* Check for any blocking processes */
+                                "WRITE",
+                                execute_write_callback,
+                                (void*)data);
+}
+
 void execute_read_task(pid_t task_pid)
 {
     pid_t child_pid = fork();
 
-    if (child_pid < 0)
+    if(child_pid < 0)
     {
         perror("fork failed for read task");
         return;
     }
 
-    if (child_pid == 0)
+    if(child_pid == 0)
     {
         /* Child process - execute read */
         LockInfo* lock;
-        char log_message[4096];
+        char log_message[LOG_BUFFER_SIZE];
         pid_t my_pid = getpid();
 
-        /* Add to active processes */
-        add_active_process(my_pid, SHARED_LOCK);
-
-        /* Count active read processes (including this one) */
-        int active_reads = count_active_read_processes();
+    add_active_process(my_pid, SHARED_LOCK);
+    int active_reads = count_active_read_processes();
 
         snprintf(log_message, sizeof(log_message),
                  "Forked read process %d: Started reading for task PID %d (running simultaneously with %d other active read process(es))\n",
@@ -1161,13 +1571,12 @@ void execute_read_task(pid_t task_pid)
         stream_write_logfile(log_message);
 
         lock = try_acquire_lock_nonblocking(SHARED_LOCK);
-        if (lock != NULL)
+
+        if(lock != NULL)
         {
             read_from_file(task_pid, lock);
             release_lock_info(lock);
             remove_active_process(my_pid);
-
-            /* Increment completed tasks counter */
             increment_completed_tasks();
 
             snprintf(log_message, sizeof(log_message),
@@ -1181,319 +1590,326 @@ void execute_read_task(pid_t task_pid)
         {
             remove_active_process(my_pid);
 
+            char active_list[ACTIVE_LIST_SIZE];
+            get_active_processes_list(active_list, sizeof(active_list));
             snprintf(log_message, sizeof(log_message),
-                     "Forked read process %d: Failed to acquire lock for task PID %d\n",
-                     (int)my_pid, (int)task_pid);
+                     "Forked read process %d: READ task for PID %d rejected - failed to acquire lock. Blocking processes: %s\n",
+                     (int)my_pid, (int)task_pid, active_list);
             stream_write_logfile(log_message);
 
+            fprintf(stderr, "Fatal error: Forked read process failed to acquire lock\n");
             exit(1);
         }
     }
-    /* Parent continues - don't wait for child, let it run independently */
-    /* Use waitpid with WNOHANG to avoid blocking */
     waitpid(child_pid, NULL, WNOHANG);
 }
 
-/* Worker process - processes tasks from queue file */
-void worker_process()
+static int process_task_in_worker(TaskContext* ctx)
+{
+    char log_message[LOG_BUFFER_SIZE];
+    char active_list_check[ACTIVE_LIST_SIZE];
+    int is_blocked;
+    int (*check_blocking)(void);
+    const char* operation_name;
+
+    if(ctx->lock_type == SHARED_LOCK)
+    {
+        check_blocking = has_active_write_process;
+        operation_name = "READ";
+    }
+    else
+    {
+        check_blocking = has_any_active_process;
+        operation_name = "WRITE";
+    }
+
+    is_blocked = check_blocking();
+    get_active_processes_list(active_list_check, sizeof(active_list_check));
+    snprintf(log_message, sizeof(log_message),
+             "Worker: Checking active processes for %s task PID %d. Is blocked: %d. Active list: %s\n",
+             operation_name, (int)ctx->task_pid, is_blocked, active_list_check);
+    stream_write_logfile(log_message);
+
+    if(ctx->lock_type == SHARED_LOCK)
+    {
+        int recheck_count = 0;
+        while (!is_blocked && recheck_count < MAX_RECHECKS)
+        {
+            usleep(RECHECK_DELAY_US);
+            is_blocked = check_blocking();
+
+            if(is_blocked)
+            {
+                get_active_processes_list(active_list_check, sizeof(active_list_check));
+                snprintf(log_message, sizeof(log_message),
+                         "Worker: Re-checked active processes for READ task PID %d after delay (attempt %d). Is blocked: %d. Active list: %s\n",
+                         (int)ctx->task_pid, recheck_count + 1, is_blocked, active_list_check);
+                stream_write_logfile(log_message);
+                break;
+            }
+            recheck_count++;
+        }
+    }
+
+    if(is_blocked)
+    {
+        add_task_to_queue_file(ctx->task_pid, ctx->lock_type, ctx->task_data);
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: %s task for PID %d rejected - blocking processes detected, put back to queue. Blocking processes: %s\n",
+                 operation_name, (int)ctx->task_pid, active_list_check);
+        stream_write_logfile(log_message);
+        return 0;
+    }
+
+    if(ctx->should_fork)
+    {
+        int active_reads_before = count_active_read_processes();
+        execute_read_task(ctx->task_pid);
+        usleep(FORK_DELAY_US);
+
+        char active_list_after_fork[ACTIVE_LIST_SIZE];
+        get_active_processes_list(active_list_after_fork, sizeof(active_list_after_fork));
+        int waiting_count = count_queue_tasks();
+
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Forked read process for PID %d (can run simultaneously with %d other active read process(es)). Current active processes: %s. Waiting tasks: %d\n",
+                 (int)ctx->task_pid, active_reads_before, active_list_after_fork, waiting_count);
+        stream_write_logfile(log_message);
+        return 1;
+    }
+    else
+    {
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Attempting to acquire EXCLUSIVE lock for WRITE task PID %d\n",
+                 (int)ctx->task_pid);
+        stream_write_logfile(log_message);
+
+        LockInfo* lock = try_acquire_lock_nonblocking(EXCLUSIVE_LOCK);
+        if(lock == NULL)
+        {
+            snprintf(log_message, sizeof(log_message),
+                     "Worker: Failed to acquire lock for WRITE task PID %d\n",
+                     (int)ctx->task_pid);
+            stream_write_logfile(log_message);
+            get_active_processes_list(active_list_check, sizeof(active_list_check));
+            add_task_to_queue_file(ctx->task_pid, ctx->lock_type, ctx->task_data);
+            snprintf(log_message, sizeof(log_message),
+                     "Worker: WRITE task for PID %d rejected - blocking processes detected, put back to queue. Blocking processes: %s\n",
+                     (int)ctx->task_pid, active_list_check);
+            stream_write_logfile(log_message);
+            return 0;
+        }
+
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Successfully acquired lock for WRITE task PID %d\n",
+                 (int)ctx->task_pid);
+        stream_write_logfile(log_message);
+
+        /* Add to active processes BEFORE executing (so others know we're using it) */
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Adding WRITE process PID %d to active processes\n",
+                 (int)getpid());
+        stream_write_logfile(log_message);
+
+        add_active_process(getpid(), EXCLUSIVE_LOCK);
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Added WRITE process PID %d to active processes\n",
+                 (int)getpid());
+        stream_write_logfile(log_message);
+
+        /* Check waiting tasks (for logging) */
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Getting active processes list for WRITE task PID %d\n",
+                 (int)ctx->task_pid);
+        stream_write_logfile(log_message);
+
+        char active_list_after[ACTIVE_LIST_SIZE];
+        get_active_processes_list(active_list_after, sizeof(active_list_after));
+
+        snprintf(log_message, sizeof(log_message),
+                 "Worker: Counting queue tasks for WRITE task PID %d\n",
+                 (int)ctx->task_pid);
+        stream_write_logfile(log_message);
+
+        int waiting_count = count_queue_tasks();
+
+        if(waiting_count > 0)
+        {
+            snprintf(log_message, sizeof(log_message),
+                     "Worker: WRITE process PID %d is now active. %d tasks waiting in queue. Active processes: %s\n",
+                     (int)getpid(), waiting_count, active_list_after);
+            stream_write_logfile(log_message);
+        }
+
+        char* write_data = NULL;
+
+        if(strlen(ctx->task_data) > 0)
+            write_data = strdup(ctx->task_data);
+        else
+            write_data = random_data();
+
+        if(write_data != NULL)
+        {
+            write_to_file(ctx->task_pid, write_data, lock);
+            free(write_data);
+        }
+
+        release_lock_info(lock);
+        remove_active_process(getpid());
+        increment_completed_tasks();
+        print_statistics();
+        return 1;
+    }
+}
+
+void worker_process(void)
 {
     pid_t task_pid;
     LockType lock_type;
     char task_data[MAX_DATA_SIZE];
-    LockInfo* lock;
-    char log_message[4096];
-    char* write_data = NULL;
+    char log_message[LOG_BUFFER_SIZE];
+    TaskContext ctx;
 
     printf("Worker process %d: Started, processing queue...\n", (int)getpid());
 
     while (1)
     {
-        /* Clean up stale processes periodically */
         static int cleanup_count = 0;
         cleanup_count++;
-        if (cleanup_count % 20 == 0)
-        {
-            cleanup_active_processes();
-        }
 
-        /* Print statistics periodically */
+        if(cleanup_count % CLEANUP_INTERVAL == 0)
+            cleanup_active_processes();
+
         static int stats_count = 0;
         stats_count++;
-        if (stats_count % 5 == 0)
-        {
+        if(stats_count % STATS_INTERVAL == 0)
             print_statistics();
-        }
 
-        /* Try to get task from queue file */
         memset(task_data, 0, sizeof(task_data));
         int result = get_task_from_queue_file(&task_pid, &lock_type, task_data, sizeof(task_data));
-        if (result == 0)
+
+        if(result == 0)
         {
-            /* Log that worker is processing task */
-            snprintf(log_message, sizeof(log_message),
-                     "Worker: Processing task for PID %d (type: %s)\n",
-                     (int)task_pid, lock_type == SHARED_LOCK ? "READ" : "WRITE");
-            stream_write_logfile(log_message);
-
-            if (lock_type == SHARED_LOCK)
-            {
-                /* For READ: if no active write process, fork and execute */
-                char active_list_check[2048];
-                get_active_processes_list(active_list_check, sizeof(active_list_check));
-                int has_write = has_active_write_process();
-
-                /* Log check result */
-                snprintf(log_message, sizeof(log_message),
-                         "Worker: Checking active processes for READ task PID %d. Has write: %d. Active list: %s\n",
-                         (int)task_pid, has_write, active_list_check);
-                stream_write_logfile(log_message);
-
-                /* Re-check multiple times with delays to catch WRITE processes that are active */
-                /* This is important because worker processes tasks sequentially, and WRITE might */
-                /* be active when we check, but finish before we process the READ task */
-                int recheck_count = 0;
-                int max_rechecks = 5;  /* Check up to 5 times */
-                while (!has_write && recheck_count < max_rechecks)
-                {
-                    usleep(100000);  /* 100ms delay between checks */
-                    has_write = has_active_write_process();
-                    if (has_write)
-                    {
-                        /* Re-get active list after delay */
-                        get_active_processes_list(active_list_check, sizeof(active_list_check));
-                        snprintf(log_message, sizeof(log_message),
-                                 "Worker: Re-checked active processes for READ task PID %d after delay (attempt %d). Has write: %d. Active list: %s\n",
-                                 (int)task_pid, recheck_count + 1, has_write, active_list_check);
-                        stream_write_logfile(log_message);
-                        break;  /* Found active write, stop checking */
-                    }
-                    recheck_count++;
-                }
-
-                if (!has_write)
-                {
-                    /* Check how many active read processes exist before forking */
-                    int active_reads_before = count_active_read_processes();
-
-                    /* No active writes, can fork read process */
-                    execute_read_task(task_pid);
-
-                    /* Small delay to allow forked process to register */
-                    usleep(50000);  /* 50ms delay to allow forked process to register */
-
-                    /* Re-check active processes after forking */
-                    char active_list_after_fork[2048];
-                    get_active_processes_list(active_list_after_fork, sizeof(active_list_after_fork));
-                    int waiting_count = count_queue_tasks();
-
-                    snprintf(log_message, sizeof(log_message),
-                             "Worker: Forked read process for PID %d (can run simultaneously with %d other active read process(es)). Current active processes: %s. Waiting tasks: %d\n",
-                             (int)task_pid, active_reads_before, active_list_after_fork, waiting_count);
-                    stream_write_logfile(log_message);
-                }
-                else
-                {
-                    /* Active write process, put back to queue */
-                    add_task_to_queue_file(task_pid, lock_type, task_data);
-
-                    snprintf(log_message, sizeof(log_message),
-                             "Worker: READ task for PID %d rejected - active write process detected, put back to queue. Blocking processes: %s\n",
-                             (int)task_pid, active_list_check);
-                    stream_write_logfile(log_message);
-                }
-            }
-            else
-            {
-                /* For WRITE: check if any process is active */
-                char active_list_check[2048];
-                get_active_processes_list(active_list_check, sizeof(active_list_check));
-                int has_active = has_any_active_process();
-
-                /* Log check result */
-                snprintf(log_message, sizeof(log_message),
-                         "Worker: Checking active processes for WRITE task PID %d. Has active: %d. Active list: %s\n",
-                         (int)task_pid, has_active, active_list_check);
-                stream_write_logfile(log_message);
-
-                if (!has_active)
-                {
-                    /* No active processes, try to acquire exclusive lock */
-                    lock = try_acquire_lock_nonblocking(EXCLUSIVE_LOCK);
-                    if (lock != NULL)
-                    {
-                        /* Add to active processes BEFORE executing */
-                        add_active_process(getpid(), EXCLUSIVE_LOCK);
-
-                        /* Log that we added ourselves to active processes */
-                        snprintf(log_message, sizeof(log_message),
-                                 "Worker: Added WRITE process PID %d to active processes\n",
-                                 (int)getpid());
-                        stream_write_logfile(log_message);
-
-                        /* Check if there are other tasks waiting that would be blocked */
-                        /* Re-check active processes after adding ourselves */
-                        char active_list_after[2048];
-                        get_active_processes_list(active_list_after, sizeof(active_list_after));
-                        int waiting_count = count_queue_tasks();
-
-                        if (waiting_count > 0)
-                        {
-                            snprintf(log_message, sizeof(log_message),
-                                     "Worker: WRITE process PID %d is now active. %d tasks waiting in queue. Active processes: %s\n",
-                                     (int)getpid(), waiting_count, active_list_after);
-                            stream_write_logfile(log_message);
-                        }
-
-                        /* Successfully acquired lock, execute task */
-                        /* For write operations, generate random data if task_data is empty */
-                        if (strlen(task_data) > 0)
-                        {
-                            write_data = strdup(task_data);
-                        }
-                        else
-                        {
-                            write_data = random_data();
-                        }
-                        if (write_data != NULL)
-                        {
-                            write_to_file(task_pid, write_data, lock);
-                            free(write_data);
-                        }
-
-                        release_lock_info(lock);
-
-                        /* Check active processes and waiting tasks BEFORE removing ourselves */
-                        char active_list_before_remove[2048];
-                        get_active_processes_list(active_list_before_remove, sizeof(active_list_before_remove));
-                        int waiting_before_remove = count_queue_tasks();
-
-                        /* Remove from active processes AFTER executing */
-                        remove_active_process(getpid());
-
-                        /* Log that we removed ourselves from active processes */
-                        snprintf(log_message, sizeof(log_message),
-                                 "Worker: Removed WRITE process PID %d from active processes. Before removal: active=%s, waiting=%d\n",
-                                 (int)getpid(), active_list_before_remove, waiting_before_remove);
-                        stream_write_logfile(log_message);
-
-                        /* Increment completed tasks counter */
-                        increment_completed_tasks();
-
-                        snprintf(log_message, sizeof(log_message),
-                                 "Worker: Successfully processed write task for PID %d. Active processes at start: %s\n",
-                                 (int)task_pid, active_list_check);
-                        stream_write_logfile(log_message);
-
-                        /* Print statistics after completing task */
-                        print_statistics();
-                    }
-                    else
-                    {
-                        /* Lock not available, put back to queue */
-                        /* Re-check active processes after lock failure */
-                        get_active_processes_list(active_list_check, sizeof(active_list_check));
-                        add_task_to_queue_file(task_pid, lock_type, task_data);
-
-                        snprintf(log_message, sizeof(log_message),
-                                 "Worker: WRITE task for PID %d rejected - failed to acquire exclusive lock, put back to queue. Blocking processes: %s\n",
-                                 (int)task_pid, active_list_check);
-                        stream_write_logfile(log_message);
-                    }
-                }
-                else
-                {
-                    /* Active processes exist, put back to queue */
-                    add_task_to_queue_file(task_pid, lock_type, task_data);
-
-                    snprintf(log_message, sizeof(log_message),
-                             "Worker: WRITE task for PID %d rejected - active processes detected (read or write), put back to queue. Blocking processes: %s\n",
-                             (int)task_pid, active_list_check);
-                    stream_write_logfile(log_message);
-                }
-            }
+            ctx.task_pid = task_pid;
+            ctx.lock_type = lock_type;
+            ctx.task_data = task_data;
+            ctx.should_fork = (lock_type == SHARED_LOCK) ? 1 : 0;
+            process_task_in_worker(&ctx);
         }
         else
         {
-            /* Queue is empty - log occasionally */
+            int planned = get_planned_tasks_count();
+            int completed = get_completed_tasks_count();
+            int waiting = count_queue_tasks();
+            int active = count_active_processes();
+
+            if(waiting == 0 && active == 0 && planned > 0 && completed >= planned)
+            {
+                snprintf(log_message, sizeof(log_message),
+                         "Worker: All tasks completed! Planned: %d, Completed: %d. Exiting...\n",
+                         planned, completed);
+                stream_write_logfile(log_message);
+                printf("Worker: All tasks completed (%d/%d). Exiting...\n", completed, planned);
+                break;
+            }
+
             static int empty_count = 0;
             empty_count++;
-            if (empty_count % 10 == 0)  /* Log every 10th check */
+            if(empty_count % EMPTY_QUEUE_LOG_INTERVAL == 0)
             {
                 snprintf(log_message, sizeof(log_message),
-                         "Worker: Queue is empty, waiting for tasks...\n");
+                         "Worker: Queue is empty, waiting for tasks... (Planned: %d, Completed: %d, Active: %d)\n",
+                         planned, completed, active);
                 stream_write_logfile(log_message);
             }
         }
 
-        /* Sleep before next attempt - but only if we didn't process a task */
-        /* If we processed a task, check immediately for next task to catch active processes */
-        if (result != 0)
-        {
+        if(result != 0)
             sleep(WORKER_SLEEP);
-        }
         else
-        {
-            /* Just processed a task, add delay to allow other processes to register and execute */
-            /* This creates opportunity for READ tasks to see active WRITE processes */
-            usleep(200000);  /* 200ms delay to allow processes to register and execute */
-        }
+            usleep(POST_TASK_DELAY_US);
     }
 }
 
-/* Task Manager process - accepts tasks and adds to queue */
 void task_manager_process(int argc, char* argv[])
 {
     pid_t pid = getpid();
     char* write_data = NULL;
+    int result;
 
-    /* Initialize random seed */
     srand((unsigned int)(time(NULL) ^ pid));
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <read|write> [data]\n", argv[0]);
+    if(argc < 2) {
+        fprintf(stderr, "Fatal error: Usage: %s <read|write> [data]\n", argv[0]);
         fprintf(stderr, "  read  - add read task to queue\n");
         fprintf(stderr, "  write - add write task to queue\n");
         exit(1);
     }
 
-    /* Process the task */
-    if (strcmp(argv[1], "read") == 0)
+    if(strcmp(argv[1], "read") == 0)
     {
+        increment_planned_tasks();
+        result = try_read_operation(pid);
+        if(result == 0)
+        {
+            printf("Task Manager: READ operation completed immediately\n");
+            return;
+        }
         add_task_to_queue_file(pid, SHARED_LOCK, NULL);
+        printf("Task Manager: READ task added to queue (could not execute immediately)\n");
     }
-    else if (strcmp(argv[1], "write") == 0)
+    else if(strcmp(argv[1], "write") == 0)
     {
-        /* Always generate random data */
         write_data = random_data();
-
-        if (write_data == NULL)
+        if(write_data == NULL)
         {
             fprintf(stderr, "Fatal error: Failed to generate random data\n");
             exit(1);
         }
 
+        increment_planned_tasks();
+        result = try_write_operation(pid, write_data);
+        if(result == 0)
+        {
+            free(write_data);
+            printf("Task Manager: WRITE operation completed immediately\n");
+            return;
+        }
         add_task_to_queue_file(pid, EXCLUSIVE_LOCK, write_data);
         free(write_data);
+        printf("Task Manager: WRITE task added to queue (could not execute immediately)\n");
     }
     else
     {
-        fprintf(stderr, "Parameter error: Unknown command: %s\n", argv[1]);
+        fprintf(stderr, "Fatal error: Unknown command: %s\n", argv[1]);
         exit(1);
     }
-
-    printf("Task Manager: Task added to queue successfully\n");
 }
 
 int main(int argc, char* argv[])
 {
-    if (argc >= 2 && strcmp(argv[1], "worker") == 0)
+
+    if(init_queue_sorted_list() < 0)
     {
-        /* Worker process mode */
+        fprintf(stderr, "Fatal error: Failed to initialize queue sorted list\n");
+        exit(1);
+    }
+
+    if(init_active_processes_list() < 0)
+    {
+        fprintf(stderr, "Fatal error: Failed to initialize active processes list\n");
+        exit(1);
+    }
+
+    atexit(cleanup_queue_sorted_list);
+    atexit(cleanup_active_processes_list);
+
+    if(argc >= 2 && strcmp(argv[1], "worker") == 0)
+    {
         worker_process();
         return 0;
     }
 
-    /* Task Manager process mode - accepts tasks from bash */
     task_manager_process(argc, argv);
     return 0;
 }
