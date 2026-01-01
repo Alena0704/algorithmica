@@ -52,6 +52,13 @@ typedef enum {
     INVALID_LOCK = 2
 } LockType;
 
+/* Status of active processes: can be either READ_ONLY, WRITE_ONLY, or NONE */
+typedef enum {
+    ACTIVE_STATUS_NONE = 0,      /* No active processes */
+    ACTIVE_STATUS_READ_ONLY = 1, /* Only READ processes active (one or multiple) */
+    ACTIVE_STATUS_WRITE_ONLY = 2 /* Only one WRITE process active */
+} ActiveProcessStatus;
+
 typedef struct {
     int fd;
     LockType lock_type;
@@ -61,52 +68,38 @@ typedef struct TaskData {
     pid_t pid;
     LockType lock_type;
     char data[MAX_DATA_SIZE];
-    int next_index;
+    int next_index;          // Для цепочек коллизий в хеш-таблице
+    int queue_next_index;    // Для отсортированной очереди по PID
     int in_use;
+    int was_in_queue;        // Флаг: была ли задача ранее в очереди
 } TaskData;
-
-typedef struct PidNode {
-    pid_t pid;
-    int next_index;
-    int in_use;
-    int was_in_queue;
-} PidNode;
 
 typedef struct {
     int bucket_heads[HASH_TABLE_SIZE];
     TaskData tasks[HASH_TABLE_SIZE * 4];
     int free_list_head;
     int count;
+    // Индексы для отсортированной очереди по PID
+    int queue_head_index;    // Индекс элемента с минимальным PID
+    int queue_tail_index;    // Индекс элемента с максимальным PID
 } TaskDataHashTable;
 
 typedef struct {
-    int head_index;
-    int tail_index;
-    PidNode pids[MAX_QUEUE_SIZE];
-    int free_list_head;
-    int count;
-    int initialized;
-} PidSortedList;
-
-typedef struct {
     TaskDataHashTable hash_table;
-    PidSortedList sorted_list;
     int initialized;
 } TaskQueue;
 
-typedef struct ActiveProcess {
+/* Simple structure to store PID and its lock type */
+typedef struct {
     pid_t pid;
     LockType lock_type;
-    int next_index;
-    int in_use;
-} ActiveProcess;
+} ActiveProcessEntry;
 
 typedef struct {
-    int bucket_heads[HASH_TABLE_SIZE];
-    ActiveProcess processes[HASH_TABLE_SIZE * 4];
-    int free_list_head;
-    int count;
+    ActiveProcessEntry entries[MAX_ACTIVE_PROCESSES];  /* Simple array of active processes */
+    int count;                                           /* Number of active processes */
     int initialized;
+    ActiveProcessStatus status;  /* Current status: NONE, READ_ONLY, or WRITE_ONLY */
 } ActiveProcessList;
 
 static ActiveProcessList* g_active_list = NULL;
@@ -308,8 +301,8 @@ void write_to_file(pid_t pid, char* write_data, LockInfo* lock)
     if(bytes_written < 0)
     {
         fprintf(stderr, "Fatal error: write failed\n");
-        return;
-    }
+    return;
+}
 
     fsync(lock->fd);
     printf("Process %d: Wrote %zd bytes: %s", (int)pid, bytes_written, write_buffer);
@@ -321,30 +314,27 @@ static int init_active_processes_list(void);
 static void cleanup_active_processes_list(void);
 static int active_list_add_process(pid_t pid, LockType lock_type);
 static int active_list_remove_process(pid_t pid);
-static int active_list_has_process_by_type(LockType filter_type);
+//static int active_list_has_process_by_type(LockType filter_type);
 static int active_list_count_processes_by_type(LockType filter_type);
 static void active_list_get_formatted_list(char* buffer, size_t buffer_size);
 static void active_list_cleanup_dead_processes(void);
+static void active_list_update_status(void);  /* Update status based on current processes */
+ActiveProcessStatus get_active_process_status(void);  /* Get current active process status */
 
-static int has_active_process_by_type(LockType filter_type)
-{
-    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
-        return 0;
-
-    sem_wait(g_active_sem);
-    int result = active_list_has_process_by_type(filter_type);
-    sem_post(g_active_sem);
-    return result;
-}
-
+/* Check if there's an active WRITE process - using status */
+/* READ process is blocked if status is WRITE_ONLY */
 int has_active_write_process(void)
 {
-    return has_active_process_by_type(EXCLUSIVE_LOCK);
+    ActiveProcessStatus status = get_active_process_status();
+    return (status == ACTIVE_STATUS_WRITE_ONLY);
 }
 
+/* Check if there are any active processes - using status */
+/* WRITE process is blocked if status is not NONE (i.e., any processes are active) */
 int has_any_active_process(void)
 {
-    return has_active_process_by_type(INVALID_LOCK);
+    ActiveProcessStatus status = get_active_process_status();
+    return (status != ACTIVE_STATUS_NONE);
 }
 
 int add_active_process(pid_t pid, LockType lock_type)
@@ -382,6 +372,22 @@ void cleanup_active_processes(void)
     sem_post(g_active_sem);
 }
 
+/* Get current active process status */
+ActiveProcessStatus get_active_process_status(void)
+{
+    if((g_active_list == NULL || g_active_sem == NULL) && init_active_processes_list() < 0)
+        return ACTIVE_STATUS_NONE;
+
+    sem_wait(g_active_sem);
+    ActiveProcessStatus status = ACTIVE_STATUS_NONE;
+    if(g_active_list != NULL && g_active_list != MAP_FAILED && g_active_list->initialized)
+    {
+        status = g_active_list->status;
+    }
+    sem_post(g_active_sem);
+    return status;
+}
+
 // Queue management (shared memory)
 static TaskQueue* g_queue = NULL;
 static sem_t* g_queue_sem = NULL;
@@ -407,23 +413,17 @@ static void init_task_data_free_list(TaskData* tasks, int array_size, int* free_
     for (int i = 0; i < array_size - 1; i++)
     {
         tasks[i].next_index = i + 1;
+        tasks[i].queue_next_index = -1;
         tasks[i].in_use = 0;
+        tasks[i].was_in_queue = 0;
     }
     tasks[array_size - 1].next_index = -1;
+    tasks[array_size - 1].queue_next_index = -1;
+    tasks[array_size - 1].in_use = 0;
+    tasks[array_size - 1].was_in_queue = 0;
     *free_list_head = 0;
 }
-static void init_active_process_free_list(ActiveProcess* processes, int array_size, int* free_list_head)
-{
-    *free_list_head = -1;
-
-    for (int i = 0; i < array_size - 1; i++)
-    {
-        processes[i].next_index = i + 1;
-        processes[i].in_use = 0;
-    }
-    processes[array_size - 1].next_index = -1;
-    *free_list_head = 0;
-}
+/* No longer needed - using simple array instead of free list */
 
 /* Open or create shared memory file (file-based for macOS compatibility) */
 static int open_shared_memory_file(const char* filename, size_t shm_size, int* is_new)
@@ -505,23 +505,8 @@ static int init_queue_sorted_list(void)
         init_task_data_free_list(g_queue->hash_table.tasks, HASH_TABLE_SIZE * 4,
                                  &g_queue->hash_table.free_list_head);
         g_queue->hash_table.count = 0;
-
-        /* Initialize sorted list */
-        g_queue->sorted_list.head_index = -1;
-        g_queue->sorted_list.tail_index = -1;
-        g_queue->sorted_list.free_list_head = -1;
-        g_queue->sorted_list.count = 0;
-        g_queue->sorted_list.initialized = 1;
-
-        /* Initialize free list for sorted list */
-        for (int i = 0; i < MAX_QUEUE_SIZE - 1; i++)
-        {
-            g_queue->sorted_list.pids[i].next_index = i + 1;
-            g_queue->sorted_list.pids[i].in_use = 0;
-            g_queue->sorted_list.pids[i].was_in_queue = 0;
-        }
-        g_queue->sorted_list.pids[MAX_QUEUE_SIZE - 1].next_index = -1;
-        g_queue->sorted_list.free_list_head = 0;
+        g_queue->hash_table.queue_head_index = -1;  // Индекс элемента с минимальным PID
+        g_queue->hash_table.queue_tail_index = -1;  // Индекс элемента с максимальным PID
 
         g_queue->initialized = 1;
     }
@@ -574,6 +559,12 @@ static int hash_table_add_task_data(pid_t pid, LockType lock_type, const char* d
             {
                 g_queue->hash_table.tasks[current].data[0] = '\0';
             }
+            /* Ensure new fields are initialized (for backward compatibility with old data) */
+            /* If task is not in queue, initialize queue fields to safe defaults */
+            if(!g_queue->hash_table.tasks[current].was_in_queue)
+            {
+                g_queue->hash_table.tasks[current].queue_next_index = -1;
+            }
             return 0;
         }
         if(g_queue->hash_table.tasks[current].next_index < 0)
@@ -602,6 +593,8 @@ static int hash_table_add_task_data(pid_t pid, LockType lock_type, const char* d
     }
     g_queue->hash_table.tasks[free_index].in_use = 1;
     g_queue->hash_table.tasks[free_index].next_index = -1;
+    g_queue->hash_table.tasks[free_index].queue_next_index = -1;
+    g_queue->hash_table.tasks[free_index].was_in_queue = 0;
 
     /* Add to bucket chain */
     if(g_queue->hash_table.bucket_heads[bucket] >= 0)
@@ -623,160 +616,138 @@ static int hash_table_add_task_data(pid_t pid, LockType lock_type, const char* d
     return 0;
 }
 
-/* Add PID to sorted list */
-static int sorted_list_add_pid(pid_t pid, int was_in_queue)
+/* Add task to priority queue within hash table (sorted by PID) */
+/* This function adds a task index to the sorted queue, maintaining order by PID */
+static int hash_table_add_to_queue(int task_index, int was_in_queue)
+{
+    if(g_queue == NULL || task_index < 0 || task_index >= HASH_TABLE_SIZE * 4)
+        return -1;
+
+    TaskData* task = &g_queue->hash_table.tasks[task_index];
+    if(!task->in_use)
+        return -1;
+
+    /* If task was previously in queue, remove it first to reinsert in correct position */
+    if(was_in_queue)
+    {
+        /* Find and remove from current position in queue */
+        int prev_index = -1;
+        int current = g_queue->hash_table.queue_head_index;
+
+        while (current >= 0 && current < HASH_TABLE_SIZE * 4 && current != task_index)
+        {
+            if(!g_queue->hash_table.tasks[current].in_use)
+                break;
+            prev_index = current;
+            int next = g_queue->hash_table.tasks[current].queue_next_index;
+            if(next < 0 || next >= HASH_TABLE_SIZE * 4)
+                break;
+            current = next;
+        }
+
+        if(current == task_index)
+        {
+            /* Remove from queue */
+            if(prev_index >= 0)
+                g_queue->hash_table.tasks[prev_index].queue_next_index = task->queue_next_index;
+            else
+                g_queue->hash_table.queue_head_index = task->queue_next_index;
+
+            if(g_queue->hash_table.queue_tail_index == task_index)
+                g_queue->hash_table.queue_tail_index = prev_index;
+        }
+    }
+
+    task->was_in_queue = 1;
+
+    /* Always insert in sorted position by PID (for both new and repeated tasks) */
+    int insert_pos = -1;
+    int insert_prev = -1;
+    int search_current = g_queue->hash_table.queue_head_index;
+
+    while (search_current >= 0 && search_current < HASH_TABLE_SIZE * 4)
+    {
+        if(!g_queue->hash_table.tasks[search_current].in_use)
+            break;
+        if(search_current != task_index &&
+           (int)g_queue->hash_table.tasks[search_current].pid > (int)task->pid)
+        {
+            insert_pos = search_current;
+            break;
+        }
+        if(search_current != task_index)
+            insert_prev = search_current;
+        int next = g_queue->hash_table.tasks[search_current].queue_next_index;
+        if(next < 0 || next >= HASH_TABLE_SIZE * 4)
+            break;
+        search_current = next;
+    }
+
+    /* Insert at found position */
+    if(insert_pos >= 0)
+    {
+        /* Insert before insert_pos */
+        task->queue_next_index = insert_pos;
+        if(insert_prev >= 0)
+            g_queue->hash_table.tasks[insert_prev].queue_next_index = task_index;
+        else
+            g_queue->hash_table.queue_head_index = task_index;
+    }
+    else
+    {
+        /* Insert at end (largest PID or empty queue) */
+        task->queue_next_index = -1;
+        if(g_queue->hash_table.queue_tail_index >= 0)
+            g_queue->hash_table.tasks[g_queue->hash_table.queue_tail_index].queue_next_index = task_index;
+        g_queue->hash_table.queue_tail_index = task_index;
+        if(g_queue->hash_table.queue_head_index < 0)
+            g_queue->hash_table.queue_head_index = task_index;
+    }
+
+    return 0;
+}
+
+/* Find task index in hash table by PID */
+static int hash_table_find_task_index(pid_t pid)
 {
     if(g_queue == NULL)
         return -1;
 
-    /* Check if PID already exists in list */
-    int existing_index = -1;
-    int current = g_queue->sorted_list.head_index;
-    while (current >= 0 && current < MAX_QUEUE_SIZE)
+    int bucket = hash_pid(pid);
+    int current = g_queue->hash_table.bucket_heads[bucket];
+
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
     {
-        if(g_queue->sorted_list.pids[current].in_use && g_queue->sorted_list.pids[current].pid == pid)
-        {
-            existing_index = current;
-            break;
-        }
-        current = g_queue->sorted_list.pids[current].next_index;
+        if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
+            return current;
+        current = g_queue->hash_table.tasks[current].next_index;
     }
 
-    if(existing_index >= 0)
-    {
-        /* PID already exists - was rejected, need to reinsert in sorted position */
-        /* First, find where to insert (before removing - otherwise we'll lose the position) */
-        int insert_pos = -1;
-        int insert_prev = -1;
-        int search_current = g_queue->sorted_list.head_index;
-        while (search_current >= 0 && search_current < MAX_QUEUE_SIZE)
-        {
-            /* Stop when we find a PID greater than current */
-            if(g_queue->sorted_list.pids[search_current].in_use && search_current != existing_index && (int)g_queue->sorted_list.pids[search_current].pid > (int)pid)
-            {
-                insert_pos = search_current;
-                break;
-            }
-            if(search_current != existing_index)
-                insert_prev = search_current;
-            search_current = g_queue->sorted_list.pids[search_current].next_index;
-        }
+    return -1;
+}
 
-        /* Remove from current position */
-        int prev_index = -1;
-        current = g_queue->sorted_list.head_index;
-        while (current >= 0 && current != existing_index)
-        {
-            prev_index = current;
-            current = g_queue->sorted_list.pids[current].next_index;
-        }
-
-        if(prev_index >= 0)
-        {
-            g_queue->sorted_list.pids[prev_index].next_index = g_queue->sorted_list.pids[existing_index].next_index;
-        }
-        else
-        {
-            g_queue->sorted_list.head_index = g_queue->sorted_list.pids[existing_index].next_index;
-        }
-
-        if(g_queue->sorted_list.tail_index == existing_index)
-            g_queue->sorted_list.tail_index = prev_index;
-
-        g_queue->sorted_list.pids[existing_index].was_in_queue = 1;
-
-        /* Insert at found position */
-        if(insert_pos >= 0)
-        {
-            /* Insert before insert_pos */
-            g_queue->sorted_list.pids[existing_index].next_index = insert_pos;
-            if(insert_prev >= 0)
-                g_queue->sorted_list.pids[insert_prev].next_index = existing_index;
-            else
-                /* Inserting at head (smallest PID) */
-                g_queue->sorted_list.head_index = existing_index;
-        }
-        else
-        {
-            /* Insert at end (largest PID or empty list) */
-            if(g_queue->sorted_list.tail_index >= 0)
-                g_queue->sorted_list.pids[g_queue->sorted_list.tail_index].next_index = existing_index;
-            g_queue->sorted_list.tail_index = existing_index;
-            g_queue->sorted_list.pids[existing_index].next_index = -1;
-            if(g_queue->sorted_list.head_index < 0)
-                g_queue->sorted_list.head_index = existing_index;  /* Was empty list */
-        }
-
+/* Check if task is in queue by searching the queue */
+static int hash_table_is_task_in_queue(pid_t pid)
+{
+    if(g_queue == NULL)
         return 0;
-    }
 
-    /* New PID - add to end of list if was_in_queue=0, otherwise insert in sorted position */
-    if(g_queue->sorted_list.free_list_head < 0)
-        return -1;  /* No free slots */
-
-    int free_index = g_queue->sorted_list.free_list_head;
-    g_queue->sorted_list.free_list_head = g_queue->sorted_list.pids[free_index].next_index;
-
-    /* Initialize new PID node */
-    g_queue->sorted_list.pids[free_index].pid = pid;
-    g_queue->sorted_list.pids[free_index].in_use = 1;
-    g_queue->sorted_list.pids[free_index].next_index = -1;
-    g_queue->sorted_list.pids[free_index].was_in_queue = was_in_queue;
-
-    if(was_in_queue == 0)
+    int current = g_queue->hash_table.queue_head_index;
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
     {
-        /* New task - add to end of list (as per requirement) */
-        if(g_queue->sorted_list.tail_index >= 0)
-            g_queue->sorted_list.pids[g_queue->sorted_list.tail_index].next_index = free_index;
-        g_queue->sorted_list.tail_index = free_index;
-        if(g_queue->sorted_list.head_index < 0)
-            g_queue->sorted_list.head_index = free_index;
+        if(!g_queue->hash_table.tasks[current].in_use)
+            break;
+        if(g_queue->hash_table.tasks[current].pid == pid)
+            return 1;
+        int next = g_queue->hash_table.tasks[current].queue_next_index;
+        if(next < 0 || next >= HASH_TABLE_SIZE * 4)
+            break;
+        current = next;
     }
-    else
-    {
-        /* Repeated task - insert in sorted position (insertion sort from beginning) */
-        int insert_pos = -1;
-        int insert_prev = -1;
-        int search_current = g_queue->sorted_list.head_index;
-        while (search_current >= 0 && search_current < MAX_QUEUE_SIZE)
-        {
-            /* Stop when we find a PID greater than current */
-            if(g_queue->sorted_list.pids[search_current].in_use && (int)g_queue->sorted_list.pids[search_current].pid > (int)pid)
-            {
-                insert_pos = search_current;
-                break;
-            }
-            insert_prev = search_current;
-            search_current = g_queue->sorted_list.pids[search_current].next_index;
-        }
-
-        /* Insert at found position */
-        if(insert_pos >= 0)
-        {
-            /* Insert before insert_pos */
-            g_queue->sorted_list.pids[free_index].next_index = insert_pos;
-            if(insert_prev >= 0)
-                g_queue->sorted_list.pids[insert_prev].next_index = free_index;
-            else
-                /* Inserting at head */
-                g_queue->sorted_list.head_index = free_index;
-        }
-        else
-        {
-            /* Insert at end */
-            if(g_queue->sorted_list.tail_index >= 0)
-                g_queue->sorted_list.pids[g_queue->sorted_list.tail_index].next_index = free_index;
-            g_queue->sorted_list.tail_index = free_index;
-            if(g_queue->sorted_list.head_index < 0)
-                g_queue->sorted_list.head_index = free_index;
-        }
-    }
-
-    g_queue->sorted_list.count++;
     return 0;
 }
 
-/* Add task to queue (hash table + sorted list) */
+/* Add task to queue (hash table with priority queue) */
 static int sorted_list_add_task(pid_t pid, LockType lock_type, const char* data)
 {
     if((g_queue == NULL || g_queue_sem == NULL) && init_queue_sorted_list() < 0)
@@ -784,28 +755,48 @@ static int sorted_list_add_task(pid_t pid, LockType lock_type, const char* data)
 
     sem_wait(g_queue_sem);
 
-    /* Check if PID already exists in sorted list to determine if it's a new task */
-    int was_in_queue = 0;
-    int current = g_queue->sorted_list.head_index;
-    while (current >= 0 && current < MAX_QUEUE_SIZE)
+    /* Check if PID already exists in queue to determine if it's a new task */
+    int was_in_queue = hash_table_is_task_in_queue(pid);
+
+    /* Add or update task data in hash table */
+    int task_index = hash_table_find_task_index(pid);
+    if(task_index < 0)
     {
-        if(g_queue->sorted_list.pids[current].in_use && g_queue->sorted_list.pids[current].pid == pid)
+        /* New task - add to hash table */
+        if(hash_table_add_task_data(pid, lock_type, data) < 0)
         {
-            was_in_queue = 1;
-            break;
+            sem_post(g_queue_sem);
+            return -1;
         }
-        current = g_queue->sorted_list.pids[current].next_index;
+        task_index = hash_table_find_task_index(pid);
+        if(task_index < 0)
+        {
+            sem_post(g_queue_sem);
+            return -1;
+        }
     }
-
-    /* Add task data to hash table */
-    if(hash_table_add_task_data(pid, lock_type, data) < 0)
+    else
     {
-        sem_post(g_queue_sem);
-        return -1;
+        /* Update existing task data */
+        g_queue->hash_table.tasks[task_index].lock_type = lock_type;
+        if(data != NULL)
+        {
+            strncpy(g_queue->hash_table.tasks[task_index].data, data, MAX_DATA_SIZE - 1);
+            g_queue->hash_table.tasks[task_index].data[MAX_DATA_SIZE - 1] = '\0';
+        }
+        else
+        {
+            g_queue->hash_table.tasks[task_index].data[0] = '\0';
+        }
+        /* Ensure new fields are initialized (for backward compatibility with old data) */
+        if(!g_queue->hash_table.tasks[task_index].was_in_queue)
+        {
+            g_queue->hash_table.tasks[task_index].queue_next_index = -1;
+        }
     }
 
-    /* Add PID to sorted list */
-    if(sorted_list_add_pid(pid, was_in_queue) < 0)
+    /* Add task to priority queue in hash table */
+    if(hash_table_add_to_queue(task_index, was_in_queue) < 0)
     {
         sem_post(g_queue_sem);
         return -1;
@@ -830,7 +821,38 @@ static void hash_table_remove_task_data(pid_t pid)
     {
         if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
         {
-            /* Remove from chain */
+            /* Remove from queue if it's in queue */
+            if(g_queue->hash_table.tasks[current].was_in_queue)
+            {
+                int queue_prev = -1;
+                int queue_current = g_queue->hash_table.queue_head_index;
+
+                while (queue_current >= 0 && queue_current < HASH_TABLE_SIZE * 4 && queue_current != current)
+                {
+                    if(!g_queue->hash_table.tasks[queue_current].in_use)
+                        break;
+                    queue_prev = queue_current;
+                    int next = g_queue->hash_table.tasks[queue_current].queue_next_index;
+                    if(next < 0 || next >= HASH_TABLE_SIZE * 4)
+                        break;
+                    queue_current = next;
+                }
+
+                if(queue_current == current)
+                {
+                    /* Remove from queue */
+                    int next_index = g_queue->hash_table.tasks[current].queue_next_index;
+                    if(queue_prev >= 0 && queue_prev < HASH_TABLE_SIZE * 4)
+                        g_queue->hash_table.tasks[queue_prev].queue_next_index = next_index;
+                    else
+                        g_queue->hash_table.queue_head_index = next_index;
+
+                    if(g_queue->hash_table.queue_tail_index == current)
+                        g_queue->hash_table.queue_tail_index = queue_prev;
+                }
+            }
+
+            /* Remove from hash table chain */
             if(prev_index >= 0)
             {
                 g_queue->hash_table.tasks[prev_index].next_index = g_queue->hash_table.tasks[current].next_index;
@@ -843,6 +865,8 @@ static void hash_table_remove_task_data(pid_t pid)
             /* Add to free list */
             g_queue->hash_table.tasks[current].in_use = 0;
             g_queue->hash_table.tasks[current].next_index = g_queue->hash_table.free_list_head;
+            g_queue->hash_table.tasks[current].queue_next_index = -1;
+            g_queue->hash_table.tasks[current].was_in_queue = 0;
             g_queue->hash_table.free_list_head = current;
 
             g_queue->hash_table.count--;
@@ -854,34 +878,34 @@ static void hash_table_remove_task_data(pid_t pid)
 }
 
 /* Get task data from hash table by PID (lookup) */
-static int hash_table_get_task_data(pid_t pid, LockType* lock_type, char* data, size_t data_size)
-{
-    if(g_queue == NULL)
-        return -1;
+// static int hash_table_get_task_data(pid_t pid, LockType* lock_type, char* data, size_t data_size)
+// {
+//     if(g_queue == NULL)
+//         return -1;
 
-    int bucket = hash_pid(pid);
-    int current = g_queue->hash_table.bucket_heads[bucket];
+//     int bucket = hash_pid(pid);
+//     int current = g_queue->hash_table.bucket_heads[bucket];
 
-    /* Find task in hash table */
-    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
-    {
-        if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
-        {
-            *lock_type = g_queue->hash_table.tasks[current].lock_type;
-            if(data != NULL && data_size > 0)
-            {
-                strncpy(data, g_queue->hash_table.tasks[current].data, data_size - 1);
-                data[data_size - 1] = '\0';
-            }
-            return 0;
-        }
-        current = g_queue->hash_table.tasks[current].next_index;
-    }
+//     /* Find task in hash table */
+//     while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+//     {
+//         if(g_queue->hash_table.tasks[current].in_use && g_queue->hash_table.tasks[current].pid == pid)
+//         {
+//             *lock_type = g_queue->hash_table.tasks[current].lock_type;
+//             if(data != NULL && data_size > 0)
+//             {
+//                 strncpy(data, g_queue->hash_table.tasks[current].data, data_size - 1);
+//                 data[data_size - 1] = '\0';
+//             }
+//             return 0;
+//         }
+//         current = g_queue->hash_table.tasks[current].next_index;
+//     }
 
-    return -1;
-}
+//     return -1;
+// }
 
-/* Get and remove first task from sorted list (minimum PID - FIFO with priority) */
+/* Get and remove first task from priority queue (minimum PID - FIFO with priority) */
 static int sorted_list_get_task(pid_t* pid, LockType* lock_type, char* data, size_t data_size)
 {
     if(g_queue == NULL || g_queue_sem == NULL)
@@ -892,38 +916,44 @@ static int sorted_list_get_task(pid_t* pid, LockType* lock_type, char* data, siz
 
     sem_wait(g_queue_sem);
 
-    if(g_queue->sorted_list.count == 0 || g_queue->sorted_list.head_index < 0)
+    if(g_queue->hash_table.queue_head_index < 0)
     {
         sem_post(g_queue_sem);
         return -1;
     }
 
-    /* Get first PID from sorted list */
-    int selected_index = g_queue->sorted_list.head_index;
-    pid_t selected_pid = g_queue->sorted_list.pids[selected_index].pid;
-
-    /* Get task data from hash table */
-    if(hash_table_get_task_data(selected_pid, lock_type, data, data_size) < 0)
+    /* Get first task from priority queue (minimum PID) */
+    int selected_index = g_queue->hash_table.queue_head_index;
+    if(selected_index < 0 || selected_index >= HASH_TABLE_SIZE * 4)
     {
         sem_post(g_queue_sem);
         return -1;
+    }
+
+    TaskData* selected_task = &g_queue->hash_table.tasks[selected_index];
+    if(!selected_task->in_use)
+    {
+        sem_post(g_queue_sem);
+        return -1;
+    }
+
+    pid_t selected_pid = selected_task->pid;
+
+    /* Get task data */
+    *lock_type = selected_task->lock_type;
+    if(data != NULL && data_size > 0)
+    {
+        strncpy(data, selected_task->data, data_size - 1);
+        data[data_size - 1] = '\0';
     }
 
     /* Copy PID */
     *pid = selected_pid;
 
-    /* Remove PID from sorted list */
-    g_queue->sorted_list.head_index = g_queue->sorted_list.pids[selected_index].next_index;
-    if(g_queue->sorted_list.tail_index == selected_index)
-        g_queue->sorted_list.tail_index = -1;
-
-    /* Add to free list */
-    g_queue->sorted_list.pids[selected_index].in_use = 0;
-    g_queue->sorted_list.pids[selected_index].was_in_queue = 0;
-    g_queue->sorted_list.pids[selected_index].next_index = g_queue->sorted_list.free_list_head;
-    g_queue->sorted_list.free_list_head = selected_index;
-
-    g_queue->sorted_list.count--;
+    /* Remove from priority queue */
+    g_queue->hash_table.queue_head_index = selected_task->queue_next_index;
+    if(g_queue->hash_table.queue_tail_index == selected_index)
+        g_queue->hash_table.queue_tail_index = -1;
 
     /* Remove task data from hash table */
     hash_table_remove_task_data(selected_pid);
@@ -932,7 +962,7 @@ static int sorted_list_get_task(pid_t* pid, LockType* lock_type, char* data, siz
     return 0;
 }
 
-/* Count tasks in sorted list (thread-safe) */
+/* Count tasks in priority queue (thread-safe) */
 static int sorted_list_count_tasks(void)
 {
     if(g_queue == NULL || g_queue_sem == NULL)
@@ -942,7 +972,15 @@ static int sorted_list_count_tasks(void)
     }
 
     sem_wait(g_queue_sem);
-    int count = g_queue->sorted_list.count;
+    int count = 0;
+    int current = g_queue->hash_table.queue_head_index;
+    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    {
+        if(!g_queue->hash_table.tasks[current].in_use)
+            break;
+        count++;
+        current = g_queue->hash_table.tasks[current].queue_next_index;
+    }
     sem_post(g_queue_sem);
     return count;
 }
@@ -1012,12 +1050,15 @@ static int init_active_processes_list(void)
 
         memset(g_active_list, 0, shm_size);
 
-        /* Initialize hash table */
-        init_hash_table_buckets(g_active_list->bucket_heads, HASH_TABLE_SIZE);
-        init_active_process_free_list(g_active_list->processes, HASH_TABLE_SIZE * 4,
-                                     &g_active_list->free_list_head);
+        /* Initialize simple array */
         g_active_list->count = 0;
+        g_active_list->status = ACTIVE_STATUS_NONE;
         g_active_list->initialized = 1;
+    }
+    else
+    {
+        /* If list already exists, update status based on current processes */
+        active_list_update_status();
     }
 
     sem_post(g_active_sem);
@@ -1042,97 +1083,136 @@ static void cleanup_active_processes_list(void)
     }
 }
 
-/* Add active process to hash table (or update if exists) */
+/* Add active process to list (or update if exists) */
 static int active_list_add_process(pid_t pid, LockType lock_type)
 {
-    if(g_active_list == NULL)
+    if(g_active_list == NULL || g_active_list == MAP_FAILED || !g_active_list->initialized)
         return -1;
 
-    int bucket = hash_pid(pid);
-    int current = g_active_list->bucket_heads[bucket];
+    /* Safety check: ensure count is within bounds */
+    if(g_active_list->count < 0 || g_active_list->count > MAX_ACTIVE_PROCESSES)
+        g_active_list->count = 0;  /* Reset if corrupted */
 
-    /* Check if process already exists */
-    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    /* Check if process already exists - update it */
+    int count = g_active_list->count;
+    if(count > MAX_ACTIVE_PROCESSES)
+        count = MAX_ACTIVE_PROCESSES;
+
+    for (int i = 0; i < count; i++)
     {
-        if(g_active_list->processes[current].in_use &&
-            g_active_list->processes[current].pid == pid)
+        if(g_active_list->entries[i].pid == pid)
         {
             /* Update existing process */
-            g_active_list->processes[current].lock_type = lock_type;
+            g_active_list->entries[i].lock_type = lock_type;
+            active_list_update_status();
             return 0;
         }
-        if(g_active_list->processes[current].next_index < 0)
-            break;
-        current = g_active_list->processes[current].next_index;
     }
 
-    /* Find free slot */
-    if(g_active_list->free_list_head < 0)
+    /* Check if array is full */
+    if(g_active_list->count >= MAX_ACTIVE_PROCESSES)
         return -1;  /* No free slots */
 
-    int free_index = g_active_list->free_list_head;
-    g_active_list->free_list_head =
-                g_active_list->processes[free_index].next_index;
-
-    /* Initialize new process */
-    g_active_list->processes[free_index].pid = pid;
-    g_active_list->processes[free_index].lock_type = lock_type;
-    g_active_list->processes[free_index].in_use = 1;
-    g_active_list->processes[free_index].next_index = -1;
-
-    /* Add to bucket chain */
-    if(g_active_list->bucket_heads[bucket] >= 0)
-    {
-        /* Find end of chain */
-        int chain_end = g_active_list->bucket_heads[bucket];
-
-        while (g_active_list->processes[chain_end].next_index >= 0)
-            chain_end = g_active_list->processes[chain_end].next_index;
-
-        g_active_list->processes[chain_end].next_index = free_index;
-    }
-    else
-        /* First element in bucket */
-        g_active_list->bucket_heads[bucket] = free_index;
-
+    /* Add new process */
+    g_active_list->entries[g_active_list->count].pid = pid;
+    g_active_list->entries[g_active_list->count].lock_type = lock_type;
     g_active_list->count++;
+
+    /* Update status after adding process */
+    active_list_update_status();
+
     return 0;
 }
 
-/* Remove active process from hash table (cleanup) */
+/* Remove active process from list */
 static int active_list_remove_process(pid_t pid)
 {
-    if(g_active_list == NULL)
+    if(g_active_list == NULL || g_active_list == MAP_FAILED || !g_active_list->initialized)
         return -1;
 
-    int bucket = hash_pid(pid);
-    int prev_index = -1;
-    int current = g_active_list->bucket_heads[bucket];
+    /* Safety check: ensure count is within bounds */
+    if(g_active_list->count < 0 || g_active_list->count > MAX_ACTIVE_PROCESSES)
+        return -1;  /* Corrupted state */
 
-    /* Find process in hash table */
-    while (current >= 0 && current < HASH_TABLE_SIZE * 4)
+    /* Find process in array */
+    int count = g_active_list->count;
+    if(count > MAX_ACTIVE_PROCESSES)
+        count = MAX_ACTIVE_PROCESSES;
+
+    for (int i = 0; i < count; i++)
     {
-        if(g_active_list->processes[current].in_use && g_active_list->processes[current].pid == pid)
+        if(g_active_list->entries[i].pid == pid)
         {
-            /* Remove from chain */
-            if(prev_index >= 0)
-                g_active_list->processes[prev_index].next_index = g_active_list->processes[current].next_index;
-            else if(g_active_list->bucket_heads[bucket] == current)
-                g_active_list->bucket_heads[bucket] = g_active_list->processes[current].next_index;
-
-            /* Add to free list */
-            g_active_list->processes[current].in_use = 0;
-            g_active_list->processes[current].next_index = g_active_list->free_list_head;
-            g_active_list->free_list_head = current;
-
+            /* Remove by shifting remaining elements */
+            for (int j = i; j < g_active_list->count - 1; j++)
+            {
+                if(j + 1 < MAX_ACTIVE_PROCESSES)
+                    g_active_list->entries[j] = g_active_list->entries[j + 1];
+            }
             g_active_list->count--;
+
+            /* Update status after removing process */
+            active_list_update_status();
+
             return 0;
         }
-        prev_index = current;
-        current = g_active_list->processes[current].next_index;
     }
 
     return -1;  /* Process not found */
+}
+
+/* Update status based on current active processes */
+/* Status can be: NONE, READ_ONLY (one or multiple reads), or WRITE_ONLY (single write) */
+static void active_list_update_status(void)
+{
+    if(g_active_list == NULL || g_active_list == MAP_FAILED || !g_active_list->initialized)
+        return;
+
+    /* Safety check: ensure count is within bounds */
+    if(g_active_list->count < 0 || g_active_list->count > MAX_ACTIVE_PROCESSES)
+    {
+        g_active_list->count = 0;
+        g_active_list->status = ACTIVE_STATUS_NONE;
+        return;
+    }
+
+    if(g_active_list->count == 0)
+    {
+        g_active_list->status = ACTIVE_STATUS_NONE;
+        return;
+    }
+
+    /* Count READ and WRITE processes */
+    int read_count = 0;
+    int write_count = 0;
+    int count = g_active_list->count;
+    if(count > MAX_ACTIVE_PROCESSES)
+        count = MAX_ACTIVE_PROCESSES;
+
+    for (int i = 0; i < count; i++)
+    {
+        if(g_active_list->entries[i].lock_type == SHARED_LOCK)
+            read_count++;
+        else if(g_active_list->entries[i].lock_type == EXCLUSIVE_LOCK)
+            write_count++;
+    }
+
+    /* Determine status based on process types */
+    if(write_count > 0)
+    {
+        /* If there's a WRITE process, status is WRITE_ONLY (should be only one) */
+        g_active_list->status = ACTIVE_STATUS_WRITE_ONLY;
+    }
+    else if(read_count > 0)
+    {
+        /* Only READ processes (one or multiple) */
+        g_active_list->status = ACTIVE_STATUS_READ_ONLY;
+    }
+    else
+    {
+        /* No active processes */
+        g_active_list->status = ACTIVE_STATUS_NONE;
+    }
 }
 
 /* Helper: Check if process is alive, remove if dead (cleanup zombie entries) */
@@ -1150,50 +1230,47 @@ typedef int (*ProcessCallback)(pid_t pid, LockType lock_type, void* user_data);
 
 static void iterate_active_processes(ProcessCallback callback, void* user_data, LockType filter_type)
 {
-    if(g_active_list == NULL)
+    if(g_active_list == NULL || g_active_list == MAP_FAILED || !g_active_list->initialized)
         return;
 
-    for (int i = 0; i < HASH_TABLE_SIZE; i++)
-    {
-        int current = g_active_list->bucket_heads[i];
-        while (current >= 0 && current < HASH_TABLE_SIZE * 4)
-        {
-            if(g_active_list->processes[current].in_use)
-            {
-                pid_t pid = g_active_list->processes[current].pid;
-                LockType lock_type = g_active_list->processes[current].lock_type;
+    /* Iterate through simple array - iterate backwards to avoid issues when removing elements */
+    int count = g_active_list->count;
+    if(count > MAX_ACTIVE_PROCESSES)
+        count = MAX_ACTIVE_PROCESSES;  /* Safety check */
 
-                /* Check if process is still alive (cleanup dead ones) */
-                if(check_and_cleanup_process(pid))
-                {
-                    /* If filter_type is INVALID_LOCK, match any; otherwise match specific type */
-                    if((filter_type == INVALID_LOCK || lock_type == filter_type) &&
-                                            callback(pid, lock_type, user_data) != 0)
-                            return;  /* Callback requested early termination (found what we needed) */
-                }
-            }
-            current = g_active_list->processes[current].next_index;
+    for (int i = count - 1; i >= 0; i--)
+    {
+        pid_t pid = g_active_list->entries[i].pid;
+        LockType lock_type = g_active_list->entries[i].lock_type;
+
+        /* Check if process is still alive (cleanup dead ones) */
+        if(check_and_cleanup_process(pid))
+        {
+            /* If filter_type is INVALID_LOCK, match any; otherwise match specific type */
+            if((filter_type == INVALID_LOCK || lock_type == filter_type) &&
+                                    callback(pid, lock_type, user_data) != 0)
+                    return;  /* Callback requested early termination (found what we needed) */
         }
     }
 }
 
 /* Callback for checking existence (stop as soon as we find one) */
-static int check_exists_callback(pid_t pid, LockType lock_type, void* user_data)
-{
-    (void)pid;
-    (void)lock_type;
-    int* found = (int*)user_data;
-    *found = 1;
-            return 1;
-}
+// static int check_exists_callback(pid_t pid, LockType lock_type, void* user_data)
+// {
+//     (void)pid;
+//     (void)lock_type;
+//     int* found = (int*)user_data;
+//     *found = 1;
+//             return 1;
+// }
 
 /* Check if process exists and is alive */
-static int active_list_has_process_by_type(LockType filter_type)
-{
-    int found = 0;
-    iterate_active_processes(check_exists_callback, &found, filter_type);
-    return found;
-}
+// static int active_list_has_process_by_type(LockType filter_type)
+// {
+//     int found = 0;
+//     iterate_active_processes(check_exists_callback, &found, filter_type);
+//     return found;
+// }
 
 /* Callback for counting (just increment and continue) */
 static int count_callback(pid_t pid, LockType lock_type, void* user_data)
@@ -1263,6 +1340,9 @@ static void active_list_cleanup_dead_processes(void)
 {
     /* Just iterate through all processes - check_and_cleanup_process will remove dead ones */
     iterate_active_processes(count_callback, NULL, INVALID_LOCK);
+
+    /* Update status after cleanup */
+    active_list_update_status();
 }
 
 int count_queue_tasks(void)
@@ -1624,10 +1704,13 @@ static int process_task_in_worker(TaskContext* ctx)
     }
 
     is_blocked = check_blocking();
+    ActiveProcessStatus status = get_active_process_status();
     get_active_processes_list(active_list_check, sizeof(active_list_check));
+    const char* status_str = (status == ACTIVE_STATUS_NONE) ? "NONE" :
+                             (status == ACTIVE_STATUS_READ_ONLY) ? "READ_ONLY" : "WRITE_ONLY";
     snprintf(log_message, sizeof(log_message),
-             "Worker: Checking active processes for %s task PID %d. Is blocked: %d. Active list: %s\n",
-             operation_name, (int)ctx->task_pid, is_blocked, active_list_check);
+             "Worker: Checking active processes for %s task PID %d. Status: %s. Is blocked: %d. Active list: %s\n",
+             operation_name, (int)ctx->task_pid, status_str, is_blocked, active_list_check);
     stream_write_logfile(log_message);
 
     if(ctx->lock_type == SHARED_LOCK)
@@ -1640,10 +1723,13 @@ static int process_task_in_worker(TaskContext* ctx)
 
             if(is_blocked)
             {
+                ActiveProcessStatus recheck_status = get_active_process_status();
                 get_active_processes_list(active_list_check, sizeof(active_list_check));
+                const char* recheck_status_str = (recheck_status == ACTIVE_STATUS_NONE) ? "NONE" :
+                                                  (recheck_status == ACTIVE_STATUS_READ_ONLY) ? "READ_ONLY" : "WRITE_ONLY";
                 snprintf(log_message, sizeof(log_message),
-                         "Worker: Re-checked active processes for READ task PID %d after delay (attempt %d). Is blocked: %d. Active list: %s\n",
-                         (int)ctx->task_pid, recheck_count + 1, is_blocked, active_list_check);
+                         "Worker: Re-checked active processes for READ task PID %d after delay (attempt %d). Status: %s. Is blocked: %d. Active list: %s\n",
+                         (int)ctx->task_pid, recheck_count + 1, recheck_status_str, is_blocked, active_list_check);
                 stream_write_logfile(log_message);
                 break;
             }
